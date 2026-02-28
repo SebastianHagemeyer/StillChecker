@@ -30,9 +30,6 @@ class RaspiNinjaFrameReader:
         self.buf = None
         self.width = None
         self.height = None
-        self.last_frame_ts = None          # last time a NEW frame arrived
-        self.stream_stall_s = 5.0          # seconds before alarm
-        self.stream_alarm_active = False   # avoid spam
 
     def open(self):
         self.shm = shared_memory.SharedMemory(name=self.shm_name)
@@ -57,7 +54,6 @@ class RaspiNinjaFrameReader:
             self.open()
 
         for _ in range(max_tries):
-            # Read meta directly from shared memory (not from a copied snapshot)
             m1 = self.buf[0:5].copy()
             w1 = int(m1[0]) * 255 + int(m1[1])
             h1 = int(m1[2]) * 255 + int(m1[3])
@@ -74,16 +70,13 @@ class RaspiNinjaFrameReader:
                 time.sleep(0.001)
                 continue
 
-            # Copy only the pixel region (faster + less likely to race)
             pix = self.buf[start:end].copy()
 
-            # Re-read meta after the pixel copy
             m2 = self.buf[0:5].copy()
             w2 = int(m2[0]) * 255 + int(m2[1])
             h2 = int(m2[2]) * 255 + int(m2[3])
             fid2 = int(m2[4])
 
-            # Accept only if meta stayed stable during copy
             if (w1, h1, fid1) != (w2, h2, fid2):
                 time.sleep(0.001)
                 continue
@@ -100,19 +93,17 @@ class ChangePlotGUI(tk.Tk):
     - Computes frame-to-frame change (mean absolute diff in grayscale).
     - Only computes/stores change when a NEW frame_id arrives.
     - Beeps if change stays below threshold for N seconds.
-    - Optional ROI and optional hidden video stream.
+    - Stream stall watchdog (repeating beeps).
+    - ROI selection on video.
+    - Pop-out plot window (uses a second FigureCanvasTkAgg so it keeps updating).
     """
     def __init__(
         self,
         shm_name_default="psm_raspininja_streamid",
         update_ms=250,
         history_seconds=60,
-        change_threshold=2.0,        # "meaningful change" threshold
-        stable_seconds_to_alarm=5.0,  # seconds below threshold before beep
-        # Stream stall watchdog
-        last_frame_ts = None,
-        stream_stall_s = 5.0 ,         # seconds before considering stream stalled
-        stream_alarm_active = False
+        change_threshold=2.0,
+        stable_seconds_to_alarm=5.0,
     ):
         super().__init__()
         self.title("Raspberry.Ninja → Frame Change Plotter (ROI optional)")
@@ -120,14 +111,13 @@ class ChangePlotGUI(tk.Tk):
 
         # Stream stall watchdog
         self.last_frame_ts = None
-        self.stream_stall_s = 5.0          # seconds before considering stream stalled
+        self.stream_stall_s = 5.0
         self.stream_alarm_active = False
+        self.stall_beep_every_s = 1.0
+        self.stall_last_beep_ts = 0.0
 
         self.update_ms = update_ms
         self.history_seconds = history_seconds
-
-        self.stall_beep_every_s = 1.0   # seconds between beeps
-        self.stall_last_beep_ts = 0.0
 
         # Alarm config
         self.change_threshold_var = tk.DoubleVar(value=float(change_threshold))
@@ -144,7 +134,7 @@ class ChangePlotGUI(tk.Tk):
         self.frame_bgr = None
         self.frame_id = None
         self.tk_img = None
-        self.img_item_id = None  # <-- add this
+        self.img_item_id = None
 
         # New-frame gating
         self.last_seen_frame_id = None
@@ -155,9 +145,9 @@ class ChangePlotGUI(tk.Tk):
         self.change_history_v = []
 
         # "No-change" alarm state
-        self.stable_start_ts = None      # when we entered "below threshold"
-        self.last_beep_ts = 0.0          # rate limit beeps
-        self.beep_cooldown_s = 1.0       # don't spam bell every UI tick
+        self.stable_start_ts = None
+        self.last_beep_ts = 0.0
+        self.beep_cooldown_s = 1.0
 
         # ROI state
         self.roi = None
@@ -168,6 +158,10 @@ class ChangePlotGUI(tk.Tk):
         self._disp_scale = None
         self._disp_size = (0, 0)
 
+        # Plot popout state (second canvas)
+        self.graph_popup = None
+        self.plot_canvas_popup = None
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -177,37 +171,45 @@ class ChangePlotGUI(tk.Tk):
         top = ttk.Frame(self)
         top.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
 
-        ttk.Label(top, text="Shared memory name:").pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.shm_name, width=34).pack(side=tk.LEFT, padx=8)
-        ttk.Button(top, text="Connect", command=self.connect).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT, padx=4)
+        row1 = ttk.Frame(top)
+        row1.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Label(top, text="Update (ms):").pack(side=tk.LEFT, padx=(20, 4))
+        row2 = ttk.Frame(top)
+        row2.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+
+        # ----- Row 1: connection + sampling + alarm inputs -----
+        ttk.Label(row1, text="Shared memory name:").pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.shm_name, width=34).pack(side=tk.LEFT, padx=8)
+        ttk.Button(row1, text="Connect", command=self.connect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(row1, text="Update (ms):").pack(side=tk.LEFT, padx=(20, 4))
         self.update_ms_var = tk.IntVar(value=self.update_ms)
-        ttk.Entry(top, textvariable=self.update_ms_var, width=8).pack(side=tk.LEFT)
-        ttk.Button(top, text="Apply", command=self.apply_update_rate).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(row1, textvariable=self.update_ms_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(row1, text="Apply", command=self.apply_update_rate).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(top, text="History (s):").pack(side=tk.LEFT, padx=(20, 4))
+        ttk.Label(row1, text="History (s):").pack(side=tk.LEFT, padx=(20, 4))
         self.history_s_var = tk.IntVar(value=self.history_seconds)
-        ttk.Entry(top, textvariable=self.history_s_var, width=8).pack(side=tk.LEFT)
-        ttk.Button(top, text="Apply", command=self.apply_history_window).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(row1, textvariable=self.history_s_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(row1, text="Apply", command=self.apply_history_window).pack(side=tk.LEFT, padx=4)
 
-        ttk.Checkbutton(top, text="Show video", variable=self.show_video_var, command=self.on_toggle_video).pack(
-            side=tk.LEFT, padx=(20, 0)
-        )
+        ttk.Checkbutton(
+            row1, text="Show video", variable=self.show_video_var, command=self.on_toggle_video
+        ).pack(side=tk.LEFT, padx=(20, 0))
 
-        ttk.Label(top, text="No-change threshold:").pack(side=tk.LEFT, padx=(20, 4))
-        ttk.Entry(top, textvariable=self.change_threshold_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(row1, text="No-change threshold:").pack(side=tk.LEFT, padx=(20, 4))
+        ttk.Entry(row1, textvariable=self.change_threshold_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Label(top, text="Alarm after (s):").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(row1, text="Alarm after (s):").pack(side=tk.LEFT, padx=(12, 4))
         self.alarm_seconds_var = tk.DoubleVar(value=float(self.stable_seconds_to_alarm))
-        ttk.Entry(top, textvariable=self.alarm_seconds_var, width=6).pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.alarm_seconds_var, width=6).pack(side=tk.LEFT)
 
-        ttk.Button(top, text="Apply alarm", command=self.apply_alarm_settings).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row1, text="Apply alarm", command=self.apply_alarm_settings).pack(side=tk.LEFT, padx=6)
 
-
-        ttk.Button(top, text="Clear plot", command=self.clear_plot).pack(side=tk.LEFT, padx=(20, 4))
-        ttk.Button(top, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=4)
+        # ----- Row 2: actions -----
+        ttk.Button(row2, text="Clear plot", command=self.clear_plot).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="Pop out graph", command=self.popout_graph).pack(side=tk.LEFT, padx=4)
 
         stats = ttk.Frame(self)
         stats.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 10))
@@ -220,7 +222,9 @@ class ChangePlotGUI(tk.Tk):
         self.roi_var = tk.StringVar(value="ROI: none (whole frame)")
         ttk.Label(stats, textvariable=self.roi_var).pack(side=tk.LEFT, padx=20)
 
-        self.alarm_var = tk.StringVar(value=f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s")
+        self.alarm_var = tk.StringVar(
+            value=f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s"
+        )
         ttk.Label(stats, textvariable=self.alarm_var).pack(side=tk.LEFT, padx=20)
 
         main = ttk.Frame(self)
@@ -240,7 +244,9 @@ class ChangePlotGUI(tk.Tk):
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
 
-        ttk.Label(self.right, text="Frame-to-frame change (mean abs diff in grayscale):").pack(side=tk.TOP, anchor="w")
+        ttk.Label(self.right, text="Frame-to-frame change (mean abs diff in grayscale):").pack(
+            side=tk.TOP, anchor="w"
+        )
         self.fig = Figure(figsize=(5, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("Time (s ago)")
@@ -290,7 +296,7 @@ class ChangePlotGUI(tk.Tk):
     def on_toggle_video(self):
         if not self.show_video_var.get():
             self.canvas.delete("IMG")
-            self.img_item_id = None  # <-- add this
+            self.img_item_id = None
             if self.roi_rect_id is not None:
                 self.canvas.delete(self.roi_rect_id)
                 self.roi_rect_id = None
@@ -309,6 +315,50 @@ class ChangePlotGUI(tk.Tk):
             self.canvas.delete(self.roi_rect_id)
             self.roi_rect_id = None
 
+    # ---------- Plot pop-out (safe approach: second canvas for same Figure) ----------
+
+    def popout_graph(self):
+        # Already open?
+        if self.graph_popup is not None and self.graph_popup.winfo_exists():
+            self.graph_popup.lift()
+            return
+
+        self.graph_popup = tk.Toplevel(self)
+        self.graph_popup.title("Change Plot")
+        self.graph_popup.geometry("900x550")
+        self.graph_popup.protocol("WM_DELETE_WINDOW", self._close_graph_popup)
+
+        # Create a NEW canvas that draws the SAME figure
+        self.plot_canvas_popup = FigureCanvasTkAgg(self.fig, master=self.graph_popup)
+        self.plot_canvas_popup.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        controls = ttk.Frame(self.graph_popup)
+        controls.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=8)
+        ttk.Button(controls, text="Dock graph", command=self._close_graph_popup).pack(side=tk.RIGHT)
+
+        # initial paint
+        self.plot_canvas_popup.draw_idle()
+
+    def _close_graph_popup(self):
+        if self.plot_canvas_popup is not None:
+            try:
+                self.plot_canvas_popup.get_tk_widget().destroy()
+            except Exception:
+                pass
+        self.plot_canvas_popup = None
+
+        if self.graph_popup is not None and self.graph_popup.winfo_exists():
+            self.graph_popup.destroy()
+        self.graph_popup = None
+
+        # Ensure main plot is refreshed
+        try:
+            self.plot_canvas.draw_idle()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------------------
+
     def connect(self):
         self.disconnect()
         name = self.shm_name.get().strip()
@@ -321,6 +371,9 @@ class ChangePlotGUI(tk.Tk):
             self.prev_gray = None
             self.last_seen_frame_id = None
             self.stable_start_ts = None
+            self.last_frame_ts = None
+            self.stream_alarm_active = False
+            self.stall_last_beep_ts = 0.0
             self.status_var.set(f"Status: connected to {name}")
         except Exception as e:
             self.reader = None
@@ -336,9 +389,12 @@ class ChangePlotGUI(tk.Tk):
         self.prev_gray = None
         self.last_seen_frame_id = None
         self.stable_start_ts = None
+        self.last_frame_ts = None
+        self.stream_alarm_active = False
+        self.stall_last_beep_ts = 0.0
 
-        self.canvas.delete("IMG")   # optional cleanup
-        self.img_item_id = None     # <-- add this
+        self.canvas.delete("IMG")
+        self.img_item_id = None
 
         self.status_var.set("Status: not connected")
 
@@ -359,7 +415,7 @@ class ChangePlotGUI(tk.Tk):
             self.status_var.set(f"Status: read error: {e}")
             frame_bgr = None
 
-        # --- STALL WATCHDOG: run EVERY tick ---
+        # --- STALL WATCHDOG: run EVERY tick (repeat-beep while stalled) ---
         if self.last_frame_ts is not None:
             stalled_for = now - self.last_frame_ts
             if stalled_for >= self.stream_stall_s:
@@ -368,7 +424,7 @@ class ChangePlotGUI(tk.Tk):
                     self.bell()
                 self.stream_alarm_active = True
                 self.alarm_var.set(f"STREAM STALLED: no new frames for {stalled_for:.1f}s")
-        # --------------------------------------
+        # ------------------------------------------------------------------
 
         if frame_bgr is None:
             return
@@ -381,22 +437,17 @@ class ChangePlotGUI(tk.Tk):
                 self._draw_video(self.frame_bgr)
             return
 
-        # New frame arrived: update last_frame_ts here (and clear alarm)
+        # New frame arrived: update last_frame_ts here (and clear stall alarm)
         self.last_seen_frame_id = frame_id
         self.last_frame_ts = now
-        self.frame_bgr = frame_bgr   # <-- add this
+        self.frame_bgr = frame_bgr
         self.stream_alarm_active = False
-
         self.stall_last_beep_ts = 0.0
-
         self.alarm_var.set(f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s")
-        
-
 
         # Compute change vs previous frame (grayscale)
         gray = self._bgr_to_gray_u8(frame_bgr)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
 
         change_val = None
         if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
@@ -409,44 +460,35 @@ class ChangePlotGUI(tk.Tk):
                 if (x2 - x1) >= 2 and (y2 - y1) >= 2:
                     a = gray[y1:y2, x1:x2].astype(np.int16)
                     b = self.prev_gray[y1:y2, x1:x2].astype(np.int16)
-                    #change_val = float(np.abs(a - b).mean())
                     d = np.abs(a - b)
-                    d = d[d >= 2]              # per-pixel deadband (tune 2..8)
+                    d = d[d >= 2]
                     change_val = float(d.mean()) if d.size else 0.0
                 else:
                     a = gray.astype(np.int16)
                     b = self.prev_gray.astype(np.int16)
                     d = np.abs(a - b)
-                    d = d[d >= 2]              # per-pixel deadband (tune 2..8)
+                    d = d[d >= 2]
                     change_val = float(d.mean()) if d.size else 0.0
-                    #change_val = float(np.abs(a - b).mean())
             else:
                 a = gray.astype(np.int16)
                 b = self.prev_gray.astype(np.int16)
                 change_val = float(np.abs(a - b).mean())
 
-
         self.prev_gray = gray
 
-        # Record + plot + alarm logic (only when we have a change value, i.e., after at least 2 frames)
         if change_val is not None:
             self.metric_var.set(f"Change: {change_val:.3f}")
-            now = time.time()
-            self.change_history_t.append(now)
+            tnow = time.time()
+            self.change_history_t.append(tnow)
             self.change_history_v.append(change_val)
-            self._trim_history(now)
+            self._trim_history(tnow)
             self._redraw_plot()
+            self._update_no_change_alarm(change_val, tnow)
 
-            self._update_no_change_alarm(change_val, now)
-
-        # Draw video if enabled (only on new frames to reduce CPU)
         if self.show_video_var.get():
             self._draw_video(frame_bgr)
 
     def _update_no_change_alarm(self, change_val: float, now: float):
-        """
-        Beep if change stays below threshold continuously for stable_seconds_to_alarm.
-        """
         thr = float(self.change_threshold_var.get())
 
         if change_val < thr:
@@ -455,13 +497,11 @@ class ChangePlotGUI(tk.Tk):
 
             stable_for = now - self.stable_start_ts
             if stable_for >= self.stable_seconds_to_alarm:
-                # rate limit beeps
                 if (now - self.last_beep_ts) >= self.beep_cooldown_s:
                     self.last_beep_ts = now
-                    self.bell()  # Tk system beep
-                    self.alarm_var.set(f"Alarm: NO CHANGE for {stable_for:.1f}s (< {thr:g})  🔔")
+                    self.bell()
+                    self.alarm_var.set(f"Alarm: NO CHANGE for {stable_for:.1f}s (< {thr:g})")
         else:
-            # reset stable timer once change is above threshold
             self.stable_start_ts = None
             self.alarm_var.set(f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s")
 
@@ -477,10 +517,12 @@ class ChangePlotGUI(tk.Tk):
             self.ax.set_xlim(0, self.history_seconds)
             self.ax.set_ylim(0, 255)
             self.plot_canvas.draw_idle()
+            if self.plot_canvas_popup is not None:
+                self.plot_canvas_popup.draw_idle()
             return
 
         now = time.time()
-        xs = [(now - t) for t in self.change_history_t]  # seconds ago
+        xs = [(now - t) for t in self.change_history_t]
         ys = self.change_history_v
 
         self.line.set_data(xs, ys)
@@ -488,7 +530,10 @@ class ChangePlotGUI(tk.Tk):
 
         y_max = max(5.0, float(max(ys)) * 1.2)
         self.ax.set_ylim(0, min(255.0, y_max))
+
         self.plot_canvas.draw_idle()
+        if self.plot_canvas_popup is not None:
+            self.plot_canvas_popup.draw_idle()
 
     def _draw_video(self, frame_bgr):
         frame_rgb = frame_bgr[:, :, ::-1]
@@ -505,11 +550,8 @@ class ChangePlotGUI(tk.Tk):
 
         self.tk_img = ImageTk.PhotoImage(img_disp)
 
-        # Create once; then update in-place (DO NOT delete/recreate each tick)
         if self.img_item_id is None:
-            self.img_item_id = self.canvas.create_image(
-                0, 0, anchor="nw", image=self.tk_img, tags="IMG"
-            )
+            self.img_item_id = self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img, tags="IMG")
         else:
             self.canvas.itemconfig(self.img_item_id, image=self.tk_img)
 
@@ -555,8 +597,7 @@ class ChangePlotGUI(tk.Tk):
         self.drag_start = (event.x, event.y)
         if self.roi_rect_id is None:
             self.roi_rect_id = self.canvas.create_rectangle(
-                event.x, event.y, event.x, event.y,
-                outline="#00ff00", width=2
+                event.x, event.y, event.x, event.y, outline="#00ff00", width=2
             )
         else:
             self.canvas.coords(self.roi_rect_id, event.x, event.y, event.x, event.y)
@@ -597,6 +638,10 @@ class ChangePlotGUI(tk.Tk):
         self.roi_var.set(f"ROI: ({x_min},{y_min})→({x_max},{y_max})")
 
     def on_close(self):
+        try:
+            self._close_graph_popup()
+        except Exception:
+            pass
         self.disconnect()
         self.destroy()
 
