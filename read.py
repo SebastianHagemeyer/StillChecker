@@ -14,7 +14,18 @@
 
 
 # unset DISPLAY WAYLAND_DISPLAY
+
+# net stop LxssManager  wsl --shutdown
+
+# STEP 1
+# wsl
 # python3 publish.py --framebuffer yLMwvzc --noaudio
+
+
+# STEP 2
+# wsl
+# source .venv/bin/activate
+# python3 readnew2.py
 
 import time
 import tkinter as tk

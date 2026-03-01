@@ -111,7 +111,7 @@ class ChangePlotGUI(tk.Tk):
 
         # Stream stall watchdog
         self.last_frame_ts = None
-        self.stream_stall_s = 5.0
+        self.stream_stall_s = 30
         self.stream_alarm_active = False
         self.stall_beep_every_s = 1.0
         self.stall_last_beep_ts = 0.0
