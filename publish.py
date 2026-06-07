@@ -5454,9 +5454,17 @@ class WebRTCClient:
         if remote_label:
             self._set_display_mode("remote", remote_label=remote_label)
 
+    def _viewer_should_auto_restart(self) -> bool:
+        """Modes that pull a remote stream and should auto-reconnect when the peer drops.
+
+        --framebuffer receives a remote stream exactly like --view, so it needs the same
+        reconnect behaviour even though self.view is not set in framebuffer mode.
+        """
+        return bool(self.view or self.framebuffer)
+
     def _request_view_stream_restart(self):
         """Reissue a play request for the active viewer stream with controlled backoff."""
-        if not self.view:
+        if not self._viewer_should_auto_restart():
             return
         base_stream = getattr(self, "streamin", None)
         if not base_stream:
@@ -5528,7 +5536,7 @@ class WebRTCClient:
             return
         if not getattr(self, "_viewer_restart_enabled", True):
             return
-        if not self.view:
+        if not self._viewer_should_auto_restart():
             return
         if delay is None:
             delay = float(getattr(self, "_viewer_restart_long_delay", 180.0))
@@ -5584,7 +5592,7 @@ class WebRTCClient:
         return bucket
 
     def _restart_viewer_for_redundancy_change(self):
-        if not self.view:
+        if not self._viewer_should_auto_restart():
             return
         base_stream = getattr(self, "streamin", None)
         if not base_stream:
@@ -7382,7 +7390,15 @@ class WebRTCClient:
                     if "VP8" in name:
                         out = Gst.parse_bin_from_description("queue ! rtpvp8depay ! queue max-size-buffers=0 max-size-time=0 ! decodebin ! videoconvert ! video/x-raw,format=BGR ! queue max-size-buffers=2 leaky=downstream ! appsink name=appsink", True)
                     elif "H264" in name:
-                        out = Gst.parse_bin_from_description("queue ! rtph264depay ! h264parse ! queue max-size-buffers=0 max-size-time=0 ! openh264dec ! videoconvert ! video/x-raw,format=BGR ! queue max-size-buffers=2 leaky=downstream ! appsink name=appsink", True)
+                        # avdec_h264 (libav) conceals packet loss and keeps emitting frames,
+                        # whereas openh264dec tends to freeze on a missing/corrupt frame. Prefer
+                        # avdec_h264 and only fall back to openh264dec if libav isn't installed.
+                        h264_tail = "videoconvert ! video/x-raw,format=BGR ! queue max-size-buffers=2 leaky=downstream ! appsink name=appsink"
+                        try:
+                            out = Gst.parse_bin_from_description(f"queue ! rtph264depay ! h264parse ! queue max-size-buffers=0 max-size-time=0 ! avdec_h264 ! {h264_tail}", True)
+                        except Exception:
+                            printwarn("avdec_h264 unavailable; falling back to openh264dec for framebuffer decode")
+                            out = Gst.parse_bin_from_description(f"queue ! rtph264depay ! h264parse ! queue max-size-buffers=0 max-size-time=0 ! openh264dec ! {h264_tail}", True)
                     
                     self.pipe.add(out)
                     out.sync_state_with_parent()
@@ -9596,7 +9612,7 @@ class WebRTCClient:
                 print(f"Client {UUID} not found in clients list")
                 return
             should_restart = (
-                bool(self.view)
+                self._viewer_should_auto_restart()
                 and not getattr(self, "_shutdown_requested", False)
                 and bool(self._viewer_restart_enabled)
             )
