@@ -4,7 +4,7 @@
 
 # python3 publish.py --view AcUnJQm --record out.webm
 
-
+# python3 publish.py --view zGEqDYY --record out.webm
 # python3 publish.py --framebuffer yLMwvzc
 
 
@@ -18,13 +18,16 @@
 # net stop LxssManager  wsl --shutdown
 
 # STEP 1
+# cd raspberry_ninja
 # wsl
-# python3 publish.py --framebuffer yLMwvzc --noaudio
+# python3 publish.py --framebuffer zGEqDYY --noaudio
+# J7fThJa
 
-
-# STEP 2
+# STEP 2 NEW TERMINAL
 # wsl
+# cd raspberry_ninja
 # source .venv/bin/activate
+# 
 # python3 readnew2.py
 
 import time

@@ -151,7 +151,8 @@ class ChangePlotGUI(tk.Tk):
         self.no_change_alarm_active = False
 
         # ROI state
-        self.roi = None
+        self.roi = None              # cached pixel ROI for current frame size
+        self.roi_norm = None         # normalized ROI: (x1f, y1f, x2f, y2f) in 0..1
         self.roi_rect_id = None
         self.drag_start = None
 
@@ -163,14 +164,12 @@ class ChangePlotGUI(tk.Tk):
         self.graph_popup = None
         self.plot_canvas_popup = None
 
-
-         # ---- INDICATOR POP-OUT ----
+        # ---- INDICATOR POP-OUT ----
         self.indicator_popup = None
         self.indicator_label = None
 
         # How often "red beep" is allowed (reuse your cooldown if you want)
         self.indicator_size_px = 70
-
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -220,7 +219,6 @@ class ChangePlotGUI(tk.Tk):
         ttk.Button(row2, text="Clear plot", command=self.clear_plot).pack(side=tk.LEFT, padx=4)
         ttk.Button(row2, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=4)
         ttk.Button(row2, text="Pop out graph", command=self.popout_graph).pack(side=tk.LEFT, padx=4)
-
 
         ttk.Button(row2, text="Indicator", command=self.toggle_indicator).pack(side=tk.LEFT, padx=4)
 
@@ -314,7 +312,6 @@ class ChangePlotGUI(tk.Tk):
                 self.canvas.delete(self.roi_rect_id)
                 self.roi_rect_id = None
 
-
     # ================= INDICATOR POP-OUT =================
 
     def toggle_indicator(self):
@@ -363,7 +360,6 @@ class ChangePlotGUI(tk.Tk):
         else:
             self._set_indicator_colour("green")
 
-
     def clear_plot(self):
         self.change_history_t.clear()
         self.change_history_v.clear()
@@ -373,10 +369,35 @@ class ChangePlotGUI(tk.Tk):
 
     def clear_roi(self):
         self.roi = None
+        self.roi_norm = None
         self.roi_var.set("ROI: none (whole frame)")
         if self.roi_rect_id is not None:
             self.canvas.delete(self.roi_rect_id)
             self.roi_rect_id = None
+
+    def get_current_roi_pixels(self, width: int, height: int):
+        if self.roi_norm is None:
+            self.roi = None
+            return None
+
+        x1f, y1f, x2f, y2f = self.roi_norm
+
+        x1 = int(round(x1f * width))
+        x2 = int(round(x2f * width))
+        y1 = int(round(y1f * height))
+        y2 = int(round(y2f * height))
+
+        x1 = max(0, min(x1, width - 1))
+        x2 = max(0, min(x2, width))
+        y1 = max(0, min(y1, height - 1))
+        y2 = max(0, min(y2, height))
+
+        if (x2 - x1) < 2 or (y2 - y1) < 2:
+            self.roi = None
+            return None
+
+        self.roi = (x1, y1, x2, y2)
+        return self.roi
 
     # ---------- Plot pop-out (safe approach: second canvas for same Figure) ----------
 
@@ -513,7 +534,7 @@ class ChangePlotGUI(tk.Tk):
         self.no_change_alarm_active = False
         self.alarm_var.set(f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s")
 
-       # Compute change vs previous frame (COLOUR chroma in Lab a/b)
+        # Compute change vs previous frame (COLOUR chroma in Lab a/b)
         lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
         lab = cv2.GaussianBlur(lab, (5, 5), 0)
 
@@ -523,20 +544,12 @@ class ChangePlotGUI(tk.Tk):
         if prev_lab is not None and prev_lab.shape == lab.shape:
             H, W = lab.shape[:2]
 
-            if self.roi is not None:
-                x1, y1, x2, y2 = self.roi
+            roi_px = self.get_current_roi_pixels(W, H)
 
-                x1 = max(0, min(int(x1), W - 1))
-                x2 = max(0, min(int(x2), W))
-                y1 = max(0, min(int(y1), H - 1))
-                y2 = max(0, min(int(y2), H))
-
-                if (x2 - x1) >= 2 and (y2 - y1) >= 2:
-                    cur = lab[y1:y2, x1:x2]
-                    prev = prev_lab[y1:y2, x1:x2]
-                else:
-                    cur = lab
-                    prev = prev_lab
+            if roi_px is not None:
+                x1, y1, x2, y2 = roi_px
+                cur = lab[y1:y2, x1:x2]
+                prev = prev_lab[y1:y2, x1:x2]
             else:
                 cur = lab
                 prev = prev_lab
@@ -552,8 +565,6 @@ class ChangePlotGUI(tk.Tk):
 
         # Store previous for next frame
         self.prev_lab = lab
-
-        
 
         if change_val is not None:
             self.metric_var.set(f"Change: {change_val:.3f}")
@@ -720,8 +731,18 @@ class ChangePlotGUI(tk.Tk):
             self.clear_roi()
             return
 
+        h, w, _ = self.frame_bgr.shape
+        self.roi_norm = (
+            x_min / w,
+            y_min / h,
+            x_max / w,
+            y_max / h,
+        )
+
         self.roi = (x_min, y_min, x_max, y_max)
-        self.roi_var.set(f"ROI: ({x_min},{y_min})→({x_max},{y_max})")
+        self.roi_var.set(
+            f"ROI norm: ({self.roi_norm[0]:.3f},{self.roi_norm[1]:.3f})→({self.roi_norm[2]:.3f},{self.roi_norm[3]:.3f})"
+        )
 
     def on_close(self):
         try:
