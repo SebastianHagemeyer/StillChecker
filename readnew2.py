@@ -138,6 +138,8 @@ class ChangePlotGUI(tk.Tk):
 
         # New-frame gating
         self.last_seen_frame_id = None
+        # Last *distinct* frame (raw BGR) used to reject duplicate frames
+        self.last_distinct_bgr = None
 
         # Change detection state
         self.prev_gray = None
@@ -433,6 +435,7 @@ class ChangePlotGUI(tk.Tk):
             self.reader.open()
             self.prev_gray = None
             self.last_seen_frame_id = None
+            self.last_distinct_bgr = None
             self.stable_start_ts = None
             self.last_frame_ts = None
             self.stream_alarm_active = False
@@ -451,6 +454,7 @@ class ChangePlotGUI(tk.Tk):
         self.reader = None
         self.prev_gray = None
         self.last_seen_frame_id = None
+        self.last_distinct_bgr = None
         self.stable_start_ts = None
         self.last_frame_ts = None
         self.stream_alarm_active = False
@@ -512,6 +516,19 @@ class ChangePlotGUI(tk.Tk):
         self.stall_last_beep_ts = 0.0
         self.no_change_alarm_active = False
         self.alarm_var.set(f"Alarm: beeps if change < threshold for {self.stable_seconds_to_alarm:.0f}s")
+
+        # Duplicate-frame guard: at low framerates the capture pipeline can hand us the
+        # same decoded frame again with a fresh counter. Two identical frames produce a
+        # fake 0.0 difference that real encoding noise never does, so skip duplicates and
+        # keep comparing the last *distinct* frame with the next *distinct* one.
+        if (self.last_distinct_bgr is not None
+                and frame_bgr.shape == self.last_distinct_bgr.shape
+                and np.array_equal(frame_bgr, self.last_distinct_bgr)):
+            self.status_var.set(f"Status: frame {frame_id} | {w}x{h} (duplicate, skipped)")
+            if self.show_video_var.get():
+                self._draw_video(frame_bgr)
+            return
+        self.last_distinct_bgr = frame_bgr
 
        # Compute change vs previous frame (COLOUR chroma in Lab a/b)
         lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
