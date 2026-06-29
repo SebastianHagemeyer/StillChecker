@@ -661,6 +661,17 @@ class ChangePlotGUI(tk.Tk):
         self._disp_scale = scale
         self._disp_size = (new_w, new_h)
 
+        # Keep the green ROI box aligned with the (re)scaled video. The ROI is
+        # stored in image coords, so re-project it every draw - this is what
+        # makes it follow the video when the window is resized.
+        if self.roi is not None and self.roi_rect_id is not None:
+            x_min, y_min, x_max, y_max = self.roi
+            self.canvas.coords(
+                self.roi_rect_id,
+                x_min * scale, y_min * scale,
+                x_max * scale, y_max * scale,
+            )
+
         if self.roi_rect_id is not None:
             self.canvas.tag_raise(self.roi_rect_id)
 
