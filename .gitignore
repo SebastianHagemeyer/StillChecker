@@ -202,3 +202,6 @@ recording_test.py
 
 # macOS specific
 .DS_Store
+
+# Cook timer runtime state
+cook_timer.json

@@ -1,4 +1,7 @@
 import time
+import os
+import json
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
@@ -173,9 +176,17 @@ class ChangePlotGUI(tk.Tk):
         # How often "red beep" is allowed (reuse your cooldown if you want)
         self.indicator_size_px = 70
 
+        # ---- COOK TIMER ----
+        # cook_start_ts is the epoch seconds of the active cook, or None when idle.
+        # Persisted to JSON so the timer keeps running across program restarts.
+        self.cook_start_ts = None
+        self.cook_history = []
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Restore any cook that was still running when the program was last closed.
+        self._load_cook_state()
 
         self.after(0, self.update_loop)
 
@@ -225,6 +236,19 @@ class ChangePlotGUI(tk.Tk):
 
 
         ttk.Button(row2, text="Indicator", command=self.toggle_indicator).pack(side=tk.LEFT, padx=4)
+
+        # ----- Row 3: cook timer -----
+        row3 = ttk.Frame(top)
+        row3.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+
+        self.start_cook_btn = ttk.Button(row3, text="Start cooking", command=self.start_cooking)
+        self.start_cook_btn.pack(side=tk.LEFT, padx=4)
+
+        self.finish_cook_btn = ttk.Button(row3, text="Finished cooking", command=self.finish_cooking)
+        self.finish_cook_btn.pack(side=tk.LEFT, padx=4)
+
+        self.cook_var = tk.StringVar(value="Cook: idle")
+        ttk.Label(row3, textvariable=self.cook_var).pack(side=tk.LEFT, padx=12)
 
         stats = ttk.Frame(self)
         stats.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 10))
@@ -380,6 +404,96 @@ class ChangePlotGUI(tk.Tk):
             self.canvas.delete(self.roi_rect_id)
             self.roi_rect_id = None
 
+    # ================= COOK TIMER =================
+
+    def _cook_json_path(self):
+        # Keep the state file next to this script so it is found regardless of cwd.
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cook_timer.json")
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        seconds = int(max(0, seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:d}:{m:02d}:{s:02d}"
+
+    def _save_cook_state(self):
+        active = self.cook_start_ts is not None
+        data = {
+            "active": active,
+            "start": self.cook_start_ts,
+            "start_iso": (
+                datetime.fromtimestamp(self.cook_start_ts).isoformat(timespec="seconds")
+                if active else None
+            ),
+            "history": self.cook_history,
+        }
+        try:
+            with open(self._cook_json_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.status_var.set(f"Status: could not save cook timer: {e}")
+
+    def _load_cook_state(self):
+        path = self._cook_json_path()
+        if not os.path.exists(path):
+            self._refresh_cook_ui()
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.cook_history = data.get("history", []) or []
+            if data.get("active") and data.get("start"):
+                self.cook_start_ts = float(data["start"])
+        except Exception as e:
+            self.status_var.set(f"Status: could not load cook timer: {e}")
+        self._refresh_cook_ui()
+
+    def start_cooking(self):
+        if self.cook_start_ts is not None:
+            messagebox.showinfo(
+                "Cooking in progress",
+                "A cook is already running.\nPress 'Finished cooking' before starting a new one.",
+            )
+            return
+        self.cook_start_ts = time.time()
+        self._save_cook_state()
+        self._refresh_cook_ui()
+
+    def finish_cooking(self):
+        if self.cook_start_ts is None:
+            messagebox.showinfo("No cook running", "Press 'Start cooking' first.")
+            return
+        end = time.time()
+        start = self.cook_start_ts
+        duration = end - start
+        self.cook_history.append({
+            "start": start,
+            "start_iso": datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+            "end": end,
+            "end_iso": datetime.fromtimestamp(end).isoformat(timespec="seconds"),
+            "duration_s": round(duration, 1),
+            "duration_hms": self._fmt_duration(duration),
+        })
+        self.cook_start_ts = None
+        self._save_cook_state()
+        self._refresh_cook_ui()
+        messagebox.showinfo("Cook finished", f"Total cooking time: {self._fmt_duration(duration)}")
+
+    def _refresh_cook_ui(self):
+        # Enable/disable buttons so a new cook can't start until this one is finished.
+        cooking = self.cook_start_ts is not None
+        self.start_cook_btn.config(state=("disabled" if cooking else "normal"))
+        self.finish_cook_btn.config(state=("normal" if cooking else "disabled"))
+        self._update_cook_label()
+
+    def _update_cook_label(self):
+        if self.cook_start_ts is None:
+            self.cook_var.set("Cook: idle")
+        else:
+            elapsed = time.time() - self.cook_start_ts
+            self.cook_var.set(f"Cook: running {self._fmt_duration(elapsed)}")
+
     # ---------- Plot pop-out (safe approach: second canvas for same Figure) ----------
 
     def popout_graph(self):
@@ -469,6 +583,9 @@ class ChangePlotGUI(tk.Tk):
 
     def update_loop(self):
         self.after(self.update_ms, self.update_loop)
+
+        # Keep the cook timer ticking regardless of stream/connection state.
+        self._update_cook_label()
 
         if self.reader is None:
             return
