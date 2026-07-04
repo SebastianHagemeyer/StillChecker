@@ -21,7 +21,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 RATTLE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rattle_cadence.json")
-RATTLE_SNR_LINE = 1.4   # "rattling" activity threshold, drawn on the graph
 
 
 class RaspiNinjaFrameReader:
@@ -176,6 +175,7 @@ class ChangePlotGUI(tk.Tk):
         # ---- RATTLE (audio cadence) state ----
         self.rattle_history_t = []
         self.rattle_history_v = []
+        self.rattle_history_on = []
         self._rattle_mtime = None
         self._rattle_last_on_ts = None
         self._rattle_stopped_alerted = False
@@ -315,10 +315,10 @@ class ChangePlotGUI(tk.Tk):
 
         self.ax_rattle = self.fig.add_subplot(212)
         self.ax_rattle.set_xlabel("Time (s ago)")
-        self.ax_rattle.set_ylabel("Rattle activity (×floor)")
+        self.ax_rattle.set_ylabel("Hiss level (green = rattling)")
         self.ax_rattle.grid(True)
-        self.ax_rattle.axhline(RATTLE_SNR_LINE, color="#e5484d", ls="--", lw=0.8)
-        self.line_rattle, = self.ax_rattle.plot([], [], color="#7C3AED")
+        self.line_rattle, = self.ax_rattle.plot([], [], color="#7C3AED", lw=0.8, alpha=0.45)
+        self._rattle_fill = None
 
         self.fig.subplots_adjust(hspace=0.35, left=0.16, right=0.97, top=0.97, bottom=0.1)
         self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.right)
@@ -461,6 +461,7 @@ class ChangePlotGUI(tk.Tk):
         self.change_history_v.clear()
         self.rattle_history_t.clear()
         self.rattle_history_v.clear()
+        self.rattle_history_on.clear()
         self.metric_var.set("Change: —")
         self.stable_start_ts = None
         self._redraw_plot()
@@ -805,6 +806,7 @@ class ChangePlotGUI(tk.Tk):
             return
         now = time.time()
         snr = float(data.get("snr", 0.0))
+        level = float(data.get("level", 0.0))
         rattling = bool(data.get("rattling"))
         if rattling:
             pm = float(data.get("per_min", 0.0))
@@ -820,24 +822,34 @@ class ChangePlotGUI(tk.Tk):
         else:
             self.rattle_var.set(f"Rattle: {data.get('reason', '-')}")
         self.rattle_history_t.append(now)
-        self.rattle_history_v.append(snr)
+        self.rattle_history_v.append(level)
+        self.rattle_history_on.append(1 if rattling else 0)
         cutoff = now - self.history_seconds
         while self.rattle_history_t and self.rattle_history_t[0] < cutoff:
             self.rattle_history_t.pop(0)
             self.rattle_history_v.pop(0)
+            self.rattle_history_on.pop(0)
         self._check_rattle_stopped(now, rattling)
         self._redraw_rattle()
 
     def _redraw_rattle(self):
         now = time.time()
-        if not self.rattle_history_t:
-            self.line_rattle.set_data([], [])
-        else:
-            xs = [(now - t) for t in self.rattle_history_t]
-            self.line_rattle.set_data(xs, self.rattle_history_v)
+        xs = [(now - t) for t in self.rattle_history_t]
+        self.line_rattle.set_data(xs, self.rattle_history_v)
         self.ax_rattle.set_xlim(self.history_seconds, 0)
-        y_max = max(3.0, (float(max(self.rattle_history_v)) * 1.2) if self.rattle_history_v else 3.0)
+        y_max = max(0.004, (float(max(self.rattle_history_v)) * 1.3) if self.rattle_history_v else 0.004)
         self.ax_rattle.set_ylim(0, y_max)
+        # Clean on/off bands: green where it is rattling, empty in the gaps.
+        if self._rattle_fill is not None:
+            try:
+                self._rattle_fill.remove()
+            except Exception:
+                pass
+            self._rattle_fill = None
+        if xs:
+            on = [bool(v) for v in self.rattle_history_on]
+            self._rattle_fill = self.ax_rattle.fill_between(
+                xs, 0, y_max, where=on, step="pre", color="#22c55e", alpha=0.30, linewidth=0)
         self.plot_canvas.draw_idle()
 
     def _check_rattle_stopped(self, now, rattling):

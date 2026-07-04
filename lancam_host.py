@@ -168,7 +168,8 @@ class FrameWriter:
 # absolute level is tiny, so relative energy is the reliable test, not loudness.
 # The result is written to rattle_cadence.json for the UI to pick up.
 AUDIO_RING_SECONDS = 60
-RATTLE_SNR = 1.4          # recent energy vs quiet baseline to call it "rattling"
+RATTLE_SNR_ON = 1.5       # activity (x quiet baseline) needed to switch to "rattling"
+RATTLE_SNR_OFF = 1.25     # drops below this to switch back to "quiet" (hysteresis)
 RATTLE_ABS_MIN = 1.5e-4   # tiny absolute floor so dead silence never trips it
 
 AUDIO_WORKLET_JS = r"""
@@ -294,6 +295,7 @@ class AudioSink:
         self.record = record
         self.recorder = None
         self.slow_floor = None
+        self.rattling_state = False
 
     def set_format(self, sample_rate, channels=1):
         try:
@@ -351,7 +353,11 @@ class AudioSink:
             else:
                 self.slow_floor = 0.98 * self.slow_floor + 0.02 * cand  # rise slowly
             snr = feats["recent"] / (self.slow_floor + 1e-6)
-            rattling = bool(snr >= RATTLE_SNR and feats["recent"] > RATTLE_ABS_MIN)
+            # Schmitt trigger: switch on only when clearly above, off only when
+            # clearly below, so activity grazing the line does not chatter.
+            thr = RATTLE_SNR_OFF if self.rattling_state else RATTLE_SNR_ON
+            self.rattling_state = bool(snr >= thr and feats["recent"] > RATTLE_ABS_MIN)
+            rattling = self.rattling_state
             self.latest = {
                 "rattling": rattling,
                 "snr": round(snr, 2),
