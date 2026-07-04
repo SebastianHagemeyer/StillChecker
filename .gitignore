@@ -205,3 +205,10 @@ recording_test.py
 
 # Cook timer runtime state
 cook_timer.json
+
+# LAN Cam rattle-cadence runtime state
+rattle_cadence.json
+rattle_audio_*.wav
+
+# LAN Cam self-signed TLS cert + private key (never commit)
+.lancam_certs/

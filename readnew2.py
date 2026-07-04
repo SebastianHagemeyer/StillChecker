@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
+from appicon import apply_flame_icon
 import cv2
 
 import numpy as np
@@ -17,6 +18,10 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+RATTLE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rattle_cadence.json")
+RATTLE_SNR_LINE = 1.4   # "rattling" activity threshold, drawn on the graph
 
 
 class RaspiNinjaFrameReader:
@@ -36,7 +41,10 @@ class RaspiNinjaFrameReader:
 
     def open(self):
         self.shm = shared_memory.SharedMemory(name=self.shm_name)
-        unregister(self.shm._name, "shared_memory")  # prevent warnings on exit
+        try:
+            unregister(self.shm._name, "shared_memory")  # prevent warnings on exit (POSIX only)
+        except Exception:
+            pass  # resource_tracker is POSIX-only; harmless to skip on native Windows
         self.buf = np.ndarray(self.shm.size, dtype=np.uint8, buffer=self.shm.buf)
 
     def close(self):
@@ -109,6 +117,7 @@ class ChangePlotGUI(tk.Tk):
         stable_seconds_to_alarm=5.0,
     ):
         super().__init__()
+        apply_flame_icon(self)
         self.title("Raspberry.Ninja → Frame Change Plotter (ROI optional)")
         self.geometry("1200x800")
 
@@ -164,9 +173,13 @@ class ChangePlotGUI(tk.Tk):
         self._disp_scale = None
         self._disp_size = (0, 0)
 
-        # Plot popout state (second canvas)
-        self.graph_popup = None
-        self.plot_canvas_popup = None
+        # ---- RATTLE (audio cadence) state ----
+        self.rattle_history_t = []
+        self.rattle_history_v = []
+        self._rattle_mtime = None
+        self._rattle_last_on_ts = None
+        self._rattle_stopped_alerted = False
+        self.rattle_stop_seconds = 45
 
 
          # ---- INDICATOR POP-OUT ----
@@ -189,6 +202,14 @@ class ChangePlotGUI(tk.Tk):
         self._load_cook_state()
 
         self.after(0, self.update_loop)
+
+        # Opt-in hands-off connect (set by manager2). Backwards compatible:
+        # without RN_AUTOCONNECT in the environment, Connect stays manual.
+        _auto = os.environ.get("RN_AUTOCONNECT")
+        if _auto:
+            if _auto not in ("1", "true", "True", "yes"):
+                self.shm_name.set(_auto)
+            self.after(400, self._autoconnect_tick)
 
     def _build_ui(self):
         top = ttk.Frame(self)
@@ -232,9 +253,6 @@ class ChangePlotGUI(tk.Tk):
         # ----- Row 2: actions -----
         ttk.Button(row2, text="Clear plot", command=self.clear_plot).pack(side=tk.LEFT, padx=4)
         ttk.Button(row2, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row2, text="Pop out graph", command=self.popout_graph).pack(side=tk.LEFT, padx=4)
-
-
         ttk.Button(row2, text="Indicator", command=self.toggle_indicator).pack(side=tk.LEFT, padx=4)
 
         # ----- Row 3: cook timer -----
@@ -266,6 +284,9 @@ class ChangePlotGUI(tk.Tk):
         )
         ttk.Label(stats, textvariable=self.alarm_var).pack(side=tk.LEFT, padx=20)
 
+        self.rattle_var = tk.StringVar(value="Rattle: (audio off)")
+        ttk.Label(stats, textvariable=self.rattle_var).pack(side=tk.LEFT, padx=20)
+
         main = ttk.Frame(self)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -283,16 +304,23 @@ class ChangePlotGUI(tk.Tk):
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
 
-        ttk.Label(self.right, text="Frame-to-frame change (mean abs diff in grayscale):").pack(
+        ttk.Label(self.right, text="Change (top) and rattle rate (bottom):").pack(
             side=tk.TOP, anchor="w"
         )
-        self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel("Time (s ago)")
+        self.fig = Figure(figsize=(5, 5), dpi=100)
+        self.ax = self.fig.add_subplot(211)
         self.ax.set_ylabel("Change (0..255)")
         self.ax.grid(True)
-
         self.line, = self.ax.plot([], [])
+
+        self.ax_rattle = self.fig.add_subplot(212)
+        self.ax_rattle.set_xlabel("Time (s ago)")
+        self.ax_rattle.set_ylabel("Rattle activity (×floor)")
+        self.ax_rattle.grid(True)
+        self.ax_rattle.axhline(RATTLE_SNR_LINE, color="#e5484d", ls="--", lw=0.8)
+        self.line_rattle, = self.ax_rattle.plot([], [], color="#7C3AED")
+
+        self.fig.subplots_adjust(hspace=0.35, left=0.16, right=0.97, top=0.97, bottom=0.1)
         self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.right)
         self.plot_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(6, 0))
 
@@ -351,23 +379,61 @@ class ChangePlotGUI(tk.Tk):
             return
 
         self.indicator_popup = tk.Toplevel(self)
-        self.indicator_popup.title("IND")
+        # Borderless floating dot (no title bar, not in the taskbar).
+        try:
+            self.indicator_popup.overrideredirect(True)
+        except Exception:
+            pass
         s = int(self.indicator_size_px)
         self.indicator_popup.geometry(f"{s}x{s}+40+40")
         self.indicator_popup.resizable(False, False)
 
-        # Keep it visible
+        # Stay above everything, and keep re-asserting it below.
         try:
             self.indicator_popup.attributes("-topmost", True)
         except Exception:
             pass
 
-        # A single square whose bg we change
-        self.indicator_label = tk.Label(self.indicator_popup, bg="#777777", bd=6, relief="raised")
+        # A single square whose bg we change to show state.
+        self.indicator_label = tk.Label(self.indicator_popup, bg="#777777", bd=6,
+                                        relief="raised", cursor="fleur")
         self.indicator_label.pack(fill="both", expand=True)
 
-        # Optional: click to bring main window up
-        self.indicator_label.bind("<Button-1>", lambda e: self.lift())
+        # Drag from anywhere on the dot to move it; double-click raises the main
+        # window; right-click hides the dot (there is no title bar to close it).
+        self._ind_off_x = 0
+        self._ind_off_y = 0
+        self.indicator_label.bind("<Button-1>", self._ind_press)
+        self.indicator_label.bind("<B1-Motion>", self._ind_motion)
+        self.indicator_label.bind("<Double-Button-1>", lambda e: self.lift())
+        self.indicator_label.bind("<Button-3>", lambda e: self.toggle_indicator())
+
+        self.indicator_popup.update_idletasks()
+        self.indicator_popup.lift()
+        self._ind_keep_top()
+
+    def _ind_press(self, e):
+        # Remember where on the dot we grabbed it.
+        self._ind_off_x = e.x
+        self._ind_off_y = e.y
+
+    def _ind_motion(self, e):
+        if self.indicator_popup is None or not self.indicator_popup.winfo_exists():
+            return
+        x = self.indicator_popup.winfo_pointerx() - self._ind_off_x
+        y = self.indicator_popup.winfo_pointery() - self._ind_off_y
+        self.indicator_popup.geometry(f"+{x}+{y}")
+
+    def _ind_keep_top(self):
+        # Re-assert topmost on a timer so nothing can bury the dot. Self-cancels
+        # when the popup is closed.
+        if self.indicator_popup is None or not self.indicator_popup.winfo_exists():
+            return
+        try:
+            self.indicator_popup.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.after(1500, self._ind_keep_top)
 
     def _set_indicator_colour(self, state: str):
         # state: "grey" | "red" | "green"
@@ -393,6 +459,8 @@ class ChangePlotGUI(tk.Tk):
     def clear_plot(self):
         self.change_history_t.clear()
         self.change_history_v.clear()
+        self.rattle_history_t.clear()
+        self.rattle_history_v.clear()
         self.metric_var.set("Change: —")
         self.stable_start_ts = None
         self._redraw_plot()
@@ -494,56 +562,13 @@ class ChangePlotGUI(tk.Tk):
             elapsed = time.time() - self.cook_start_ts
             self.cook_var.set(f"Cook: running {self._fmt_duration(elapsed)}")
 
-    # ---------- Plot pop-out (safe approach: second canvas for same Figure) ----------
-
-    def popout_graph(self):
-        # Already open?
-        if self.graph_popup is not None and self.graph_popup.winfo_exists():
-            self.graph_popup.lift()
-            return
-
-        self.graph_popup = tk.Toplevel(self)
-        self.graph_popup.title("Change Plot")
-        self.graph_popup.geometry("900x550")
-        self.graph_popup.protocol("WM_DELETE_WINDOW", self._close_graph_popup)
-
-        # Create a NEW canvas that draws the SAME figure
-        self.plot_canvas_popup = FigureCanvasTkAgg(self.fig, master=self.graph_popup)
-        self.plot_canvas_popup.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-        controls = ttk.Frame(self.graph_popup)
-        controls.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=8)
-        ttk.Button(controls, text="Dock graph", command=self._close_graph_popup).pack(side=tk.RIGHT)
-
-        # initial paint
-        self.plot_canvas_popup.draw_idle()
-
-    def _close_graph_popup(self):
-        if self.plot_canvas_popup is not None:
-            try:
-                self.plot_canvas_popup.get_tk_widget().destroy()
-            except Exception:
-                pass
-        self.plot_canvas_popup = None
-
-        if self.graph_popup is not None and self.graph_popup.winfo_exists():
-            self.graph_popup.destroy()
-        self.graph_popup = None
-
-        # Ensure main plot is refreshed
-        try:
-            self.plot_canvas.draw_idle()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------------------
-
-    def connect(self):
+    def connect(self, silent=False):
         self.disconnect()
         name = self.shm_name.get().strip()
         if not name:
-            messagebox.showerror("Missing", "Shared memory name is required.")
-            return
+            if not silent:
+                messagebox.showerror("Missing", "Shared memory name is required.")
+            return False
         try:
             self.reader = RaspiNinjaFrameReader(name)
             self.reader.open()
@@ -555,9 +580,18 @@ class ChangePlotGUI(tk.Tk):
             self.stream_alarm_active = False
             self.stall_last_beep_ts = 0.0
             self.status_var.set(f"Status: connected to {name}")
+            return True
         except Exception as e:
             self.reader = None
-            messagebox.showerror("Connect failed", f"Could not open shared memory:\n{name}\n\n{e}")
+            if not silent:
+                messagebox.showerror("Connect failed", f"Could not open shared memory:\n{name}\n\n{e}")
+            return False
+
+    def _autoconnect_tick(self):
+        # Opt-in (RN_AUTOCONNECT): quietly retry until the shared memory exists,
+        # so a launcher can bring the monitor up fully hands-off.
+        if self.reader is None and not self.connect(silent=True):
+            self.after(1000, self._autoconnect_tick)
 
     def disconnect(self):
         if self.reader is not None:
@@ -586,6 +620,7 @@ class ChangePlotGUI(tk.Tk):
 
         # Keep the cook timer ticking regardless of stream/connection state.
         self._update_cook_label()
+        self._poll_rattle()
 
         if self.reader is None:
             return
@@ -737,8 +772,6 @@ class ChangePlotGUI(tk.Tk):
             self.ax.set_xlim(0, self.history_seconds)
             self.ax.set_ylim(0, 255)
             self.plot_canvas.draw_idle()
-            if self.plot_canvas_popup is not None:
-                self.plot_canvas_popup.draw_idle()
             return
 
         now = time.time()
@@ -752,8 +785,74 @@ class ChangePlotGUI(tk.Tk):
         self.ax.set_ylim(0, min(255.0, y_max))
 
         self.plot_canvas.draw_idle()
-        if self.plot_canvas_popup is not None:
-            self.plot_canvas_popup.draw_idle()
+
+    def _poll_rattle(self):
+        """Read rattle_cadence.json (written ~1/s by lancam_host --audio) and
+        update the rattle readout + graph. No-op when audio isn't running."""
+        try:
+            mtime = os.path.getmtime(RATTLE_JSON)
+        except OSError:
+            if not self.rattle_history_t:
+                self.rattle_var.set("Rattle: (audio off)")
+            return
+        if mtime == self._rattle_mtime:
+            return
+        self._rattle_mtime = mtime
+        try:
+            with open(RATTLE_JSON) as f:
+                data = json.load(f)
+        except Exception:
+            return
+        now = time.time()
+        snr = float(data.get("snr", 0.0))
+        rattling = bool(data.get("rattling"))
+        if rattling:
+            pm = float(data.get("per_min", 0.0))
+            conf = float(data.get("confidence", 0.0))
+            if conf >= 0.2 and pm > 0:
+                self.rattle_var.set(f"Rattle: ON  (x{snr:.1f}, ~{pm:.0f}/min)")
+            else:
+                self.rattle_var.set(f"Rattle: ON  (x{snr:.1f})")
+            self._rattle_last_on_ts = now
+            self._rattle_stopped_alerted = False
+        elif "snr" in data:
+            self.rattle_var.set(f"Rattle: quiet  (x{snr:.1f})")
+        else:
+            self.rattle_var.set(f"Rattle: {data.get('reason', '-')}")
+        self.rattle_history_t.append(now)
+        self.rattle_history_v.append(snr)
+        cutoff = now - self.history_seconds
+        while self.rattle_history_t and self.rattle_history_t[0] < cutoff:
+            self.rattle_history_t.pop(0)
+            self.rattle_history_v.pop(0)
+        self._check_rattle_stopped(now, rattling)
+        self._redraw_rattle()
+
+    def _redraw_rattle(self):
+        now = time.time()
+        if not self.rattle_history_t:
+            self.line_rattle.set_data([], [])
+        else:
+            xs = [(now - t) for t in self.rattle_history_t]
+            self.line_rattle.set_data(xs, self.rattle_history_v)
+        self.ax_rattle.set_xlim(self.history_seconds, 0)
+        y_max = max(3.0, (float(max(self.rattle_history_v)) * 1.2) if self.rattle_history_v else 3.0)
+        self.ax_rattle.set_ylim(0, y_max)
+        self.plot_canvas.draw_idle()
+
+    def _check_rattle_stopped(self, now, rattling):
+        # Beep once (and keep showing it) if the rattle was going and then stops.
+        if rattling or self._rattle_last_on_ts is None:
+            return
+        elapsed = now - self._rattle_last_on_ts
+        if elapsed >= self.rattle_stop_seconds:
+            self.rattle_var.set(f"Rattle: STOPPED for {elapsed:.0f}s")
+            if not self._rattle_stopped_alerted:
+                self._rattle_stopped_alerted = True
+                try:
+                    self.bell()
+                except Exception:
+                    pass
 
     def _draw_video(self, frame_bgr):
         frame_rgb = frame_bgr[:, :, ::-1]
@@ -869,10 +968,6 @@ class ChangePlotGUI(tk.Tk):
         self.roi_var.set(f"ROI: ({x_min},{y_min})→({x_max},{y_max})")
 
     def on_close(self):
-        try:
-            self._close_graph_popup()
-        except Exception:
-            pass
         self.disconnect()
         self.destroy()
 
