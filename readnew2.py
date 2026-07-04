@@ -180,6 +180,8 @@ class ChangePlotGUI(tk.Tk):
         self._rattle_last_on_ts = None
         self._rattle_stopped_alerted = False
         self.rattle_stop_seconds = 45
+        self.rattle_level_thr = tk.DoubleVar(value=1.3)   # hiss level (x1000) red line
+        self._rattle_state = False
 
 
          # ---- INDICATOR POP-OUT ----
@@ -304,25 +306,47 @@ class ChangePlotGUI(tk.Tk):
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
 
-        ttk.Label(self.right, text="Change (top) and rattle rate (bottom):").pack(
-            side=tk.TOP, anchor="w"
-        )
+        ttk.Label(self.right,
+                  text="Drag the vertical sliders to set the red thresholds "
+                       "(change top, rattle/hiss bottom):").pack(side=tk.TOP, anchor="w")
+
+        plot_row = ttk.Frame(self.right)
+        plot_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        # vertical threshold sliders, one per graph (top = change, bottom = rattle)
+        sliders = ttk.Frame(plot_row)
+        sliders.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+        chg_cell = ttk.Frame(sliders); chg_cell.pack(side=tk.TOP, fill=tk.Y, expand=True)
+        ttk.Label(chg_cell, text="change").pack(side=tk.TOP)
+        tk.Scale(chg_cell, from_=20, to=0, resolution=0.5, orient=tk.VERTICAL,
+                 variable=self.change_threshold_var, command=self._on_thr_moved,
+                 showvalue=True, length=150, width=14).pack(side=tk.TOP, fill=tk.Y, expand=True)
+        rat_cell = ttk.Frame(sliders); rat_cell.pack(side=tk.TOP, fill=tk.Y, expand=True)
+        ttk.Label(rat_cell, text="rattle").pack(side=tk.TOP)
+        tk.Scale(rat_cell, from_=6.0, to=0.0, resolution=0.1, orient=tk.VERTICAL,
+                 variable=self.rattle_level_thr, command=self._on_thr_moved,
+                 showvalue=True, length=150, width=14).pack(side=tk.TOP, fill=tk.Y, expand=True)
+
         self.fig = Figure(figsize=(5, 5), dpi=100)
         self.ax = self.fig.add_subplot(211)
         self.ax.set_ylabel("Change (0..255)")
         self.ax.grid(True)
         self.line, = self.ax.plot([], [])
+        self._chg_thr_line = self.ax.axhline(self.change_threshold_var.get(),
+                                             color="#e5484d", ls="--", lw=1.0)
 
         self.ax_rattle = self.fig.add_subplot(212)
         self.ax_rattle.set_xlabel("Time (s ago)")
         self.ax_rattle.set_ylabel("Hiss level (green = rattling)")
         self.ax_rattle.grid(True)
-        self.line_rattle, = self.ax_rattle.plot([], [], color="#7C3AED", lw=0.8, alpha=0.45)
+        self.line_rattle, = self.ax_rattle.plot([], [], color="#7C3AED", lw=0.9)
+        self._rat_thr_line = self.ax_rattle.axhline(self.rattle_level_thr.get(),
+                                                    color="#e5484d", ls="--", lw=1.0)
         self._rattle_fill = None
 
         self.fig.subplots_adjust(hspace=0.35, left=0.16, right=0.97, top=0.97, bottom=0.1)
-        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.right)
-        self.plot_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=plot_row)
+        self.plot_canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     def apply_update_rate(self):
         try:
@@ -805,20 +829,23 @@ class ChangePlotGUI(tk.Tk):
         except Exception:
             return
         now = time.time()
-        snr = float(data.get("snr", 0.0))
-        level = float(data.get("level", 0.0))
-        rattling = bool(data.get("rattling"))
+        level = float(data.get("level", 0.0)) * 1000.0   # scale to a readable graph
+        thr = float(self.rattle_level_thr.get())
+        # Rattling = hiss level above the red line (set by the vertical slider),
+        # with a little hysteresis so it does not chatter right at the line.
+        if "level" not in data:
+            rattling = False
+        elif self._rattle_state:
+            rattling = level >= thr * 0.8
+        else:
+            rattling = level >= thr
+        self._rattle_state = rattling
         if rattling:
-            pm = float(data.get("per_min", 0.0))
-            conf = float(data.get("confidence", 0.0))
-            if conf >= 0.2 and pm > 0:
-                self.rattle_var.set(f"Rattle: ON  (x{snr:.1f}, ~{pm:.0f}/min)")
-            else:
-                self.rattle_var.set(f"Rattle: ON  (x{snr:.1f})")
+            self.rattle_var.set(f"Rattle: ON  (level {level:.2f} > {thr:.2f})")
             self._rattle_last_on_ts = now
             self._rattle_stopped_alerted = False
-        elif "snr" in data:
-            self.rattle_var.set(f"Rattle: quiet  (x{snr:.1f})")
+        elif "level" in data:
+            self.rattle_var.set(f"Rattle: quiet  (level {level:.2f} < {thr:.2f})")
         else:
             self.rattle_var.set(f"Rattle: {data.get('reason', '-')}")
         self.rattle_history_t.append(now)
@@ -837,7 +864,7 @@ class ChangePlotGUI(tk.Tk):
         xs = [(now - t) for t in self.rattle_history_t]
         self.line_rattle.set_data(xs, self.rattle_history_v)
         self.ax_rattle.set_xlim(self.history_seconds, 0)
-        y_max = max(0.004, (float(max(self.rattle_history_v)) * 1.3) if self.rattle_history_v else 0.004)
+        y_max = max(3.0, (float(max(self.rattle_history_v)) * 1.3) if self.rattle_history_v else 3.0)
         self.ax_rattle.set_ylim(0, y_max)
         # Clean on/off bands: green where it is rattling, empty in the gaps.
         if self._rattle_fill is not None:
@@ -851,6 +878,15 @@ class ChangePlotGUI(tk.Tk):
             self._rattle_fill = self.ax_rattle.fill_between(
                 xs, 0, y_max, where=on, step="pre", color="#22c55e", alpha=0.30, linewidth=0)
         self.plot_canvas.draw_idle()
+
+    def _on_thr_moved(self, _val=None):
+        # Move the red threshold lines to match the vertical sliders.
+        try:
+            self._chg_thr_line.set_ydata([self.change_threshold_var.get()] * 2)
+            self._rat_thr_line.set_ydata([self.rattle_level_thr.get()] * 2)
+            self.plot_canvas.draw_idle()
+        except Exception:
+            pass
 
     def _check_rattle_stopped(self, now, rattling):
         # Beep once (and keep showing it) if the rattle was going and then stops.
