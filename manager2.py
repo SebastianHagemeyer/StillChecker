@@ -13,16 +13,25 @@ terminal. Double-click manager2.bat (or run `pythonw manager2.py`) and it:
 Then it shows the link to open in Safari on your phone, with a "Copy link"
 button so you can paste it into a message and send it to yourself.
 
+The native Android app (FlameCam, android/ folder) needs no link at all: it
+finds this PC on the LAN by itself and streams with the phone screen off. The
+phone-status line shows its battery, temperature and Wi-Fi while it streams.
+Stop asks the host to shut down cleanly first, so the phone knows the stop was
+intentional and Telegram gets a final "host stopped" line.
+
 It does not touch publish.py / manager.py - this is the self-hosted LAN path,
 separate from the VDO.Ninja one.
 """
 
 import os
 import sys
+import json
+import time
 import queue
 import socket
 import threading
 import subprocess
+import urllib.request
 
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -40,6 +49,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST_PY = os.path.join(HERE, "lancam_host.py")
 MONITOR_PY = os.path.join(HERE, "readnew2.py")
 SHM_NAME = "psm_raspininja_streamid"
+STATUS_JSON = os.path.join(HERE, "lancam_status.json")
+PLAIN_PORT = 8080           # lancam_host --plain-port (Android app + /shutdown)
+RESOLUTIONS = ["960x540", "1280x720", "1920x1080"]
 IS_WIN = os.name == "nt"
 
 
@@ -60,7 +72,7 @@ class LanCamManager(tk.Tk):
         super().__init__()
         apply_flame_icon(self)
         self.title("LAN Cam Manager")
-        self.geometry("760x540")
+        self.geometry("820x600")
         self.minsize(640, 460)
 
         self.host_proc = None
@@ -91,6 +103,13 @@ class LanCamManager(tk.Tk):
         self.audio_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="Audio (rattle)", variable=self.audio_var).grid(
             row=0, column=6, sticky="w", padx=(18, 6))
+        ttk.Label(opts, text="Resolution:").grid(row=1, column=0, sticky="w", padx=6, pady=(0, 6))
+        self.res_var = tk.StringVar(value="1280x720")
+        ttk.Combobox(opts, textvariable=self.res_var, values=RESOLUTIONS, width=11,
+                     state="readonly").grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        self.telegram_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Telegram alerts (Empire bot)", variable=self.telegram_var).grid(
+            row=1, column=3, columnspan=4, sticky="w", padx=(18, 6), pady=(0, 6))
 
         btns = ttk.Frame(self)
         btns.pack(side=tk.TOP, fill=tk.X, **pad)
@@ -101,7 +120,13 @@ class LanCamManager(tk.Tk):
         self.status_var = tk.StringVar(value="Status: idle")
         ttk.Label(btns, textvariable=self.status_var).pack(side=tk.LEFT, padx=16)
 
-        link = ttk.LabelFrame(self, text="Open this on your phone (Safari)")
+        phone = ttk.LabelFrame(self, text="Phone")
+        phone.pack(side=tk.TOP, fill=tk.X, **pad)
+        self.phone_var = tk.StringVar(value="(host not running)")
+        ttk.Label(phone, textvariable=self.phone_var, font=("Segoe UI", 10)).pack(
+            side=tk.LEFT, padx=8, pady=6)
+
+        link = ttk.LabelFrame(self, text="Android app connects by itself. iPhone / Safari: open this link")
         link.pack(side=tk.TOP, fill=tk.X, **pad)
         self.url_var = tk.StringVar(value="(press Start)")
         url_entry = ttk.Entry(link, textvariable=self.url_var, state="readonly",
@@ -144,6 +169,8 @@ class LanCamManager(tk.Tk):
         port = self._clean_int(self.port_var.get(), 8443, 1, 65535)
         fps = self._clean_int(self.fps_var.get(), 10, 1, 60)
         quality = self._clean_float(self.quality_var.get(), 0.8, 0.1, 1.0)
+        res = self.res_var.get() if self.res_var.get() in RESOLUTIONS else "1280x720"
+        width, height = res.split("x")
         self.port_var.set(str(port))
         self.fps_var.set(str(fps))
         self.quality_var.set(f"{quality:g}")
@@ -153,9 +180,12 @@ class LanCamManager(tk.Tk):
 
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         host_cmd = [sys.executable, "-u", HOST_PY,
-                    "--port", str(port), "--fps", str(fps), "--quality", str(quality)]
+                    "--port", str(port), "--fps", str(fps), "--quality", str(quality),
+                    "--width", width, "--height", height, "--plain-port", str(PLAIN_PORT)]
         if self.audio_var.get():
             host_cmd.append("--audio")
+        if self.telegram_var.get():
+            host_cmd.append("--telegram")
         try:
             self.host_proc = subprocess.Popen(
                 host_cmd, cwd=HERE,
@@ -181,8 +211,8 @@ class LanCamManager(tk.Tk):
         self.copy_btn.config(state=tk.NORMAL)
 
         self._log("=" * 60)
-        self._log("Started. On the phone open: " + self.url)
-        self._log("Accept the certificate warning once, then tap 'Start camera'.")
+        self._log("Started. Android: open FlameCam and tap Start (it finds this PC).")
+        self._log("iPhone: open " + self.url + " , accept the certificate once, tap 'Start camera'.")
         self._set_status(f"running on port {port}")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -231,20 +261,43 @@ class LanCamManager(tk.Tk):
             return default
 
     # ------------------------------ stop ------------------------------
+    @staticmethod
+    def _request_host_shutdown(reason="Stop pressed in LAN Cam Manager"):
+        """Ask lancam_host to stop cleanly (tells the phone + sends the final
+        Telegram line). Returns True if the host accepted."""
+        try:
+            q = urllib.request.quote(reason)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{PLAIN_PORT}/shutdown?reason={q}", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                r.read()
+            return True
+        except Exception:
+            return False
+
     def stop(self):
         self._stop_requested = True
-        for label, proc in (("monitor", self.monitor_proc), ("host", self.host_proc)):
-            if proc and proc.poll() is None:
-                self._log(f"[manager2] stopping {label}...")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+        if self.monitor_proc and self.monitor_proc.poll() is None:
+            self._log("[manager2] stopping monitor...")
+            try:
+                self.monitor_proc.terminate()
+            except Exception:
+                pass
+        if self.host_proc and self.host_proc.poll() is None:
+            self._log("[manager2] asking host to stop cleanly...")
+            threading.Thread(target=self._request_host_shutdown, daemon=True).start()
         self._set_status("stopping")
-        self.after(2000, self._force_kill)
+        # The host gets a few seconds to say goodbye; _force_kill handles stragglers.
+        self.after(8000, self._force_kill)
 
     def _force_kill(self):
         for proc in (self.monitor_proc, self.host_proc):
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
             if proc and proc.poll() is None:
                 try:
                     proc.kill()
@@ -289,6 +342,8 @@ class LanCamManager(tk.Tk):
         except queue.Empty:
             pass
 
+        self._refresh_phone_status()
+
         if (self.host_proc is not None and self.host_proc.poll() is not None
                 and not self._stop_requested):
             code = self.host_proc.returncode
@@ -298,9 +353,62 @@ class LanCamManager(tk.Tk):
 
         self.after(150, self._tick)
 
+    # ------------------------- phone status --------------------------
+    def _refresh_phone_status(self):
+        now = time.time()
+        if now - getattr(self, "_phone_ts", 0.0) < 1.0:
+            return
+        self._phone_ts = now
+        if not (self.host_proc and self.host_proc.poll() is None):
+            self.phone_var.set("(host not running)")
+            return
+        try:
+            with open(STATUS_JSON, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            self.phone_var.set("waiting for host...")
+            return
+        if now - float(st.get("t", 0)) > 10:
+            self.phone_var.set("host not responding")
+            return
+        if not st.get("sockets"):
+            self.phone_var.set("not connected (open FlameCam on the phone and tap Start)")
+            return
+        who = (st.get("model") or "Android phone") + " (app)" if st.get("client") == "android" else "Safari camera"
+        bits = [who]
+        if st.get("streaming"):
+            w, h = (st.get("size") or [0, 0])[:2]
+            bits.append(f"streaming {w}x{h} @ {st.get('fps', 0):.0f} fps")
+        else:
+            bits.append("connected, NO FRAMES")
+        tel = st.get("telemetry") or {}
+        if tel and now - float(tel.get("rx", 0)) < 30:
+            if tel.get("battery") is not None:
+                bits.append(f"battery {tel['battery']}%" + (" charging" if tel.get("charging") else " on battery"))
+            if tel.get("battery_temp_c") is not None:
+                bits.append(f"{tel['battery_temp_c']:.1f}C")
+            if tel.get("wifi_rssi") is not None:
+                bits.append(f"Wi-Fi {tel['wifi_rssi']} dBm")
+            if tel.get("screen_on") is False:
+                bits.append("screen off")
+        if st.get("alarm"):
+            bits.append("FLAME ALARM")
+        self.phone_var.set("  |  ".join(bits))
+
     # ----------------------------- close ------------------------------
     def on_close(self):
         self._stop_requested = True
+        host_alive = self.host_proc and self.host_proc.poll() is None
+        if self.monitor_proc and self.monitor_proc.poll() is None:
+            try:
+                self.monitor_proc.terminate()
+            except Exception:
+                pass
+        if host_alive and self._request_host_shutdown("LAN Cam Manager closed"):
+            try:
+                self.host_proc.wait(timeout=8)
+            except Exception:
+                pass
         for proc in (self.monitor_proc, self.host_proc):
             if proc and proc.poll() is None:
                 try:

@@ -7,8 +7,11 @@ Flow:
 
     Phone Safari  --https-->  this host          (serves a camera page)
     Phone camera  --wss--->   this host          (full JPEG per frame)
+    Android app   --ws---->   this host :8080    (native FlameCam app, screen off;
+                                                  finds the host via UDP 47820)
                               this host  -->  'psm_raspininja_streamid' shm
-                                          -->  readnew2.py monitor (unchanged)
+                                          -->  readnew2.py monitor
+                              this host  -->  Telegram alerts (--telegram)
 
 No VDO.Ninja, no internet. Each frame is a self-contained JPEG, so the picture
 can never tear or go green: there are no reference frames to lose. If the
@@ -41,6 +44,8 @@ import os
 import socket
 import ssl
 import sys
+import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
@@ -84,6 +89,8 @@ class FrameWriter:
         self.buf = np.ndarray(self.shm.size, dtype=np.uint8, buffer=self.shm.buf)
         self.counter = 0
         self.frames = 0
+        self.last_frame_ts = 0.0     # wall time of the last frame written
+        self.size = (0, 0)
 
     @staticmethod
     def _create_shm():
@@ -148,6 +155,8 @@ class FrameWriter:
         self.counter = (self.counter + 1) % 255
         self.buf[4] = self.counter               # counter last -> signals "new"
         self.frames += 1
+        self.last_frame_ts = time.time()
+        self.size = (w, h)
         return (w, h)
 
     def close(self):
@@ -556,7 +565,7 @@ async function start(){
     stream = await navigator.mediaDevices.getUserMedia({
       audio:false,
       video:{ facingMode:{ ideal:'environment' },
-              width:{ ideal:1280 }, height:{ ideal:720 } }
+              width:{ ideal:CFG.width || 1280 }, height:{ ideal:CFG.height || 720 } }
     });
   }catch(e){
     setErr('Camera error: ' + e.name + ' - ' + e.message);
@@ -665,14 +674,31 @@ async def handle_index(request):
 
 
 async def handle_ws(request):
+    """Video socket. Used by both the Safari page (https/wss) and the native
+    Android app (plain ws on --plain-port). Binary = one JPEG frame. Text =
+    JSON from the Android app (hello / telemetry). On connect we push the
+    current config so the app follows the manager's fps/quality/size."""
     ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024)
     await ws.prepare(request)
 
-    writer = request.app["writer"]
-    pool = request.app["pool"]
-    loop = asyncio.get_event_loop()
+    app = request.app
+    writer = app["writer"]
+    pool = app["pool"]
+    loop = asyncio.get_running_loop()
     peer = request.remote
+    phone = app["phone"]
+    phone["sockets"] += 1
+    phone["peer"] = peer
+    phone["client"] = "browser"          # until an Android hello says otherwise
+    phone["connected_at"] = time.time()
+    phone.pop("bye_at", None)
+    app["video_sockets"].add(ws)
     print(f"[lancam] phone connected: {peer}", flush=True)
+
+    try:
+        await ws.send_str(json.dumps(dict(app["cfg"], type="config")))
+    except Exception:
+        pass
 
     try:
         async for msg in ws:
@@ -680,12 +706,40 @@ async def handle_ws(request):
                 # Await the decode+write so TCP flow control throttles the phone
                 # instead of letting a backlog build up here.
                 await loop.run_in_executor(pool, writer.write, msg.data)
+            elif msg.type == WSMsgType.TEXT:
+                _handle_phone_text(app, msg.data)
             elif msg.type == WSMsgType.ERROR:
                 break
     finally:
+        app["video_sockets"].discard(ws)
+        phone["sockets"] = max(0, phone["sockets"] - 1)
+        if phone["sockets"] == 0:
+            phone["disconnected_at"] = time.time()
         print(f"[lancam] phone disconnected: {peer} "
               f"(total frames written: {writer.frames})", flush=True)
     return ws
+
+
+def _handle_phone_text(app, text):
+    try:
+        info = json.loads(text)
+    except Exception:
+        return
+    if not isinstance(info, dict):
+        return
+    phone = app["phone"]
+    kind = info.get("type")
+    if kind == "hello":
+        phone["client"] = str(info.get("client", "android"))
+        phone["model"] = str(info.get("model", ""))
+        print(f"[lancam] {phone['client']} client: {phone['model']} "
+              f"(Android {info.get('android', '?')}, app {info.get('app', '?')})", flush=True)
+    elif kind == "telemetry":
+        info["rx"] = time.time()
+        phone["telemetry"] = info
+    elif kind == "bye":
+        phone["bye_at"] = time.time()
+        print(f"[lancam] phone says bye: {info.get('reason', '')}", flush=True)
 
 
 async def handle_audio_ws(request):
@@ -725,14 +779,323 @@ async def handle_favicon(request):
     return web.Response(text=svg, content_type="image/svg+xml")
 
 
-def build_app(fps, quality, idle_ms, audio=False):
+async def handle_health(request):
+    app = request.app
+    w = app["writer"]
+    return web.json_response({
+        "svc": "flamecam",
+        "frames": w.frames,
+        "last_frame_age_s": round(time.time() - w.last_frame_ts, 1) if w.last_frame_ts else None,
+        "size": list(w.size),
+        "phone_sockets": app["phone"]["sockets"],
+    })
+
+
+async def handle_shutdown(request):
+    """Graceful stop, localhost only. manager2 calls this so the host can tell
+    the phone 'intentional stop' (no false backup alert) and send a final
+    Telegram line, which a hard kill would skip."""
+    if request.remote not in ("127.0.0.1", "::1"):
+        return web.Response(status=403)
+    request.app["stop_reason"] = request.query.get("reason", "Stop pressed in LAN Cam Manager")
+    ev = request.app.get("stop_event")
+    if ev is not None:
+        ev.set()
+    return web.Response(text="bye")
+
+
+# ---------------------------------------------------------------- discovery ---
+# The Android app broadcasts "FLAMECAM_DISCOVER ..." on UDP DISCOVERY_PORT; we
+# answer (unicast) with a small JSON blob. The app takes our IP from the reply's
+# source address, so this keeps working when DHCP hands the PC a new IP.
+DISCOVERY_PORT = 47820
+DISCOVERY_MAGIC = b"FLAMECAM_DISCOVER"
+
+
+def start_discovery_responder(port, reply, stop):
+    """Plain blocking UDP thread (not asyncio: the Windows proactor loop has a
+    history of UDP transports dying on ICMP 'port unreachable')."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                s.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except Exception:
+                pass
+        s.bind(("0.0.0.0", port))
+        s.settimeout(1.0)
+    except OSError as exc:
+        print(f"[discovery] could not listen on UDP {port} ({exc}). The app can "
+              f"still connect via its remembered or manual host.", flush=True)
+        return None
+
+    def run():
+        while not stop.is_set():
+            try:
+                data, addr = s.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                continue
+            if data.startswith(DISCOVERY_MAGIC):
+                try:
+                    s.sendto(reply, addr)
+                except OSError:
+                    pass
+        s.close()
+
+    t = threading.Thread(target=run, name="discovery", daemon=True)
+    t.start()
+    return t
+
+
+# -------------------------------------------------------------- flame watch ---
+from flame_telegram import Telegram, fmt_duration   # noqa: E402
+
+ALARM_COOLDOWN_S = 120      # min gap between two "FLAME ALARM" messages
+ALARM_CLEAR_S = 6           # change must stay back this long before "cleared"
+
+
+class FlameWatch:
+    """Every 2 s: detects stream loss/recovery, reads readnew2's alarm mirror
+    (flame_alarm.json), sends Telegram alerts + a periodic status report, and
+    writes lancam_status.json for manager2's phone-status line. Alerts are
+    always printed to the log too, so it is useful even without Telegram."""
+
+    def __init__(self, app, tg, report_minutes, lost_seconds, here):
+        self.app = app
+        self.tg = tg
+        self.report_s = max(0, int(report_minutes)) * 60
+        self.lost_s = max(5, int(lost_seconds))
+        self.here = here
+        self.started = time.time()
+        self.session = False
+        self.session_start = 0.0
+        self.lost = False
+        self.lost_since = 0.0
+        self.last_report = 0.0
+        self.alarm_on = False
+        self.alarm_since = 0.0
+        self.alarm_sent = False
+        self.alarm_clear_since = None
+        self.last_alarm_msg = 0.0
+        self.samples = deque(maxlen=6)
+        self.stopping = False
+
+    # ------------------------------------------------------------ helpers
+    def send(self, text):
+        print(f"[alert] {text}", flush=True)
+        if self.tg is not None:
+            self.tg.send(text)
+
+    def _read_json(self, name):
+        try:
+            with open(os.path.join(self.here, name), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _fps(self):
+        if len(self.samples) < 2:
+            return 0.0
+        (t0, f0), (t1, f1) = self.samples[0], self.samples[-1]
+        return (f1 - f0) / (t1 - t0) if t1 > t0 else 0.0
+
+    def _who(self):
+        phone = self.app["phone"]
+        if phone.get("client") == "android":
+            return f"{phone.get('model') or 'Android phone'} (app)"
+        return "browser camera"
+
+    def _tel_text(self, max_age=None):
+        tel = self.app["phone"].get("telemetry")
+        if not tel:
+            return ""
+        age = time.time() - tel.get("rx", 0)
+        if max_age is not None and age > max_age:
+            return ""
+        bits = []
+        if tel.get("battery") is not None:
+            bits.append(f"battery {tel['battery']}%" + (" charging" if tel.get("charging") else " NOT charging"))
+        if tel.get("battery_temp_c") is not None:
+            bits.append(f"{tel['battery_temp_c']:.1f}C")
+        if tel.get("thermal"):
+            bits.append(f"thermal level {tel['thermal']}")
+        if tel.get("wifi_rssi") is not None:
+            bits.append(f"Wi-Fi {tel['wifi_rssi']} dBm")
+        txt = ", ".join(bits)
+        if txt and age > 30:
+            txt += f" ({fmt_duration(age)} ago)"
+        return txt
+
+    @staticmethod
+    def _hhmm(ts):
+        return datetime.datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "?"
+
+    # --------------------------------------------------------------- loop
+    async def run(self):
+        while True:
+            try:
+                self.tick()
+            except Exception as exc:
+                print(f"[watch] error: {exc}", flush=True)
+            await asyncio.sleep(2.0)
+
+    def tick(self):
+        now = time.time()
+        w = self.app["writer"]
+        self.samples.append((now, w.frames))
+        fresh = w.last_frame_ts > 0 and (now - w.last_frame_ts) < self.lost_s
+
+        if fresh and not self.session:
+            self.session = True
+            self.session_start = now
+            self.last_report = now
+            extra = f" Status report every {self.report_s // 60} min." if (self.report_s and self.tg) else ""
+            self.send(f"Flame cam online: {self._who()} streaming {w.size[0]}x{w.size[1]}.{extra}")
+
+        if self.session and not self.stopping:
+            if not fresh and not self.lost:
+                self.lost = True
+                self.lost_since = w.last_frame_ts
+                bye = self.app["phone"].get("bye_at")
+                if bye and now - bye < self.lost_s + 30:
+                    self.send("Flame cam: phone stopped streaming (Stop pressed on the phone).")
+                else:
+                    self.send(self._lost_text(now))
+            elif fresh and self.lost:
+                self.lost = False
+                self.send(f"Flame cam: stream back after {fmt_duration(now - self.lost_since)}. "
+                          f"{self._who()}, {w.size[0]}x{w.size[1]}.")
+
+        self._check_alarm(now, fresh)
+
+        if self.session and self.report_s and now - self.last_report >= self.report_s:
+            self.last_report = now
+            self.send(self.report(now, fresh))
+
+        self._write_status(now, fresh)
+
+    def _lost_text(self, now):
+        w = self.app["writer"]
+        phone = self.app["phone"]
+        if phone["sockets"] == 0:
+            link = f"phone disconnected at {self._hhmm(phone.get('disconnected_at'))}"
+        else:
+            link = "phone is still connected but sends no frames (camera problem?)"
+        tel = self._tel_text()
+        tail = f" Last phone status: {tel}." if tel else ""
+        return (f"Flame cam: STREAM LOST. No frames for {int(now - w.last_frame_ts)}s, "
+                f"{link}.{tail}")
+
+    def _check_alarm(self, now, fresh):
+        alarm = self._read_json("flame_alarm.json")
+        monitor_ok = alarm is not None and now - float(alarm.get("t", 0)) < 30
+        no_change = bool(monitor_ok and alarm.get("no_change") and fresh)
+
+        if no_change:
+            self.alarm_clear_since = None
+            if not self.alarm_on:
+                self.alarm_on = True
+                self.alarm_since = now - float(alarm.get("stable_for") or 0)
+                self.alarm_sent = False
+            if not self.alarm_sent and now - self.last_alarm_msg >= ALARM_COOLDOWN_S:
+                self.alarm_sent = True
+                self.last_alarm_msg = now
+                where = "watch box" if alarm.get("roi") else "picture"
+                thr = alarm.get("threshold")
+                thr_txt = f" (threshold {thr:g})" if isinstance(thr, (int, float)) else ""
+                self.send(f"FLAME ALARM: no change in the {where} for "
+                          f"{fmt_duration(now - self.alarm_since)}{thr_txt}. Check the flame!")
+        elif self.alarm_on:
+            if self.alarm_clear_since is None:
+                self.alarm_clear_since = now
+            if now - self.alarm_clear_since >= ALARM_CLEAR_S or not fresh:
+                if self.alarm_sent and fresh:
+                    self.send(f"Flame alarm cleared: change is back (alarm lasted "
+                              f"{fmt_duration(self.alarm_clear_since - self.alarm_since)}).")
+                self.alarm_on = False
+                self.alarm_sent = False
+                self.alarm_clear_since = None
+
+    def report(self, now, fresh):
+        w = self.app["writer"]
+        lines = ["Flame status report"]
+        if fresh:
+            lines.append(f"Stream: OK, {w.size[0]}x{w.size[1]} at ~{self._fps():.0f} fps from {self._who()}")
+        else:
+            lines.append(f"Stream: LOST for {fmt_duration(now - w.last_frame_ts)}")
+        tel = self._tel_text(max_age=120)
+        if tel:
+            lines.append(f"Phone: {tel}")
+        alarm = self._read_json("flame_alarm.json")
+        if alarm is None or now - float(alarm.get("t", 0)) >= 30:
+            lines.append("Monitor: not running / not connected (no flame alarm coverage!)")
+        elif self.alarm_on:
+            lines.append(f"Monitor: NO-CHANGE ALARM for {fmt_duration(now - self.alarm_since)}")
+        else:
+            lines.append("Monitor: watching" + (" (watch box set)" if alarm.get("roi") else "") + ", flame changing normally")
+        audio = self.app.get("audio")
+        if audio is not None:
+            r = audio.latest or {}
+            if "snr" in r:
+                lines.append("Rattle: " + ("RATTLING" if r.get("rattling") else "quiet") + f" (SNR {r.get('snr')})")
+            else:
+                lines.append(f"Rattle: {r.get('reason', 'no data')}")
+        cook = self._read_json("cook_timer.json")
+        if cook and cook.get("active") and cook.get("start"):
+            lines.append(f"Cook timer: {fmt_duration(now - float(cook['start']))}")
+        lines.append(f"Session: {fmt_duration(now - self.session_start)}")
+        return "\n".join(lines)
+
+    def _write_status(self, now, fresh):
+        w = self.app["writer"]
+        phone = self.app["phone"]
+        data = {
+            "t": now,
+            "streaming": fresh,
+            "fps": round(self._fps(), 1),
+            "size": list(w.size),
+            "frames": w.frames,
+            "client": phone.get("client") if phone["sockets"] else None,
+            "model": phone.get("model", ""),
+            "sockets": phone["sockets"],
+            "telemetry": phone.get("telemetry"),
+            "alarm": self.alarm_on,
+            "telegram": self.tg is not None,
+        }
+        try:
+            path = os.path.join(self.here, "lancam_status.json")
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(path + ".tmp", path)
+        except Exception:
+            pass
+
+    def shutdown(self, reason):
+        """Blocking: called from an executor on graceful stop."""
+        self.stopping = True
+        if self.session:
+            self.send(f"Flame cam host stopped ({reason}).")
+        if self.tg is not None:
+            self.tg.flush(6.0)
+
+
+# ---------------------------------------------------------------------- app ---
+def build_app(fps, quality, idle_ms, audio=False, width=1280, height=720,
+              tg=None, report_minutes=30, lost_seconds=30):
     app = web.Application()
     app["writer"] = FrameWriter()
     app["pool"] = ThreadPoolExecutor(max_workers=1, thread_name_prefix="frame")
-    app["cfg"] = {"fps": fps, "quality": quality, "idleMs": idle_ms, "audio": bool(audio)}
+    app["cfg"] = {"fps": fps, "quality": quality, "idleMs": idle_ms, "audio": bool(audio),
+                  "width": int(width), "height": int(height)}
+    app["phone"] = {"sockets": 0}
+    app["video_sockets"] = set()
     app.router.add_get("/", handle_index)
     app.router.add_get("/ws", handle_ws)
     app.router.add_get("/favicon.svg", handle_favicon)
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/shutdown", handle_shutdown)
 
     here = os.path.dirname(os.path.abspath(__file__))
     try:
@@ -746,6 +1109,8 @@ def build_app(fps, quality, idle_ms, audio=False):
         app.router.add_get("/audio", handle_audio_ws)
         app.router.add_get("/audio-worklet.js", handle_worklet)
 
+    app["watch"] = FlameWatch(app, tg, report_minutes, lost_seconds, here)
+
     async def _on_cleanup(app):
         app["pool"].shutdown(wait=False)
         app["writer"].close()
@@ -756,42 +1121,102 @@ def build_app(fps, quality, idle_ms, audio=False):
     return app
 
 
+async def serve(app, args, ssl_ctx):
+    app["stop_event"] = asyncio.Event()
+    runner = web.AppRunner(app, handle_signals=False)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", args.port, ssl_context=ssl_ctx).start()
+    if args.plain_port:
+        await web.TCPSite(runner, "0.0.0.0", args.plain_port).start()
+
+    disc_stop = threading.Event()
+    if args.plain_port and args.discovery_port:
+        reply = json.dumps({"svc": "flamecam", "v": 1, "port": args.plain_port,
+                            "tls_port": args.port, "name": socket.gethostname()}).encode()
+        start_discovery_responder(args.discovery_port, reply, disc_stop)
+
+    watch = app["watch"]
+    watch_task = asyncio.create_task(watch.run())
+    try:
+        await app["stop_event"].wait()
+    finally:
+        reason = app.get("stop_reason", "host process ended")
+        watch.stopping = True
+        disc_stop.set()
+        # Tell the Android app this is intentional, so it does not raise its
+        # "lost the PC host" backup alert.
+        for ws in list(app["video_sockets"]):
+            try:
+                await ws.send_str(json.dumps({"type": "bye", "reason": reason}))
+            except Exception:
+                pass
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, watch.shutdown, reason)
+        except Exception:
+            pass
+        watch_task.cancel()
+        await runner.cleanup()
+
+
 def main():
     ap = argparse.ArgumentParser(description="Phone-camera to shared-memory LAN host.")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTPS port (default 8443)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTPS port for Safari (default 8443)")
+    ap.add_argument("--plain-port", type=int, default=8080,
+                    help="plain ws port for the Android app (default 8080, 0 disables)")
+    ap.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT,
+                    help=f"UDP port the Android app broadcasts to (default {DISCOVERY_PORT}, 0 disables)")
     ap.add_argument("--fps", type=int, default=10, help="target capture fps on the phone (default 10)")
     ap.add_argument("--quality", type=float, default=0.8, help="JPEG quality 0..1 (default 0.8)")
+    ap.add_argument("--width", type=int, default=1280, help="requested frame width (default 1280)")
+    ap.add_argument("--height", type=int, default=720, help="requested frame height (default 720)")
     ap.add_argument("--idle-seconds", type=int, default=30,
                     help="black out the phone screen after N seconds with no touch to save "
                          "battery; streaming keeps running. 0 disables (default 30)")
     ap.add_argument("--audio", action="store_true",
                     help="also accept phone microphone audio and estimate rattle cadence "
                          "(writes rattle_cadence.json); off by default")
+    ap.add_argument("--telegram", action="store_true",
+                    help="send alerts + status reports through the Empire Telegram bot")
+    ap.add_argument("--report-minutes", type=int, default=30,
+                    help="Telegram status report interval (default 30, 0 disables)")
+    ap.add_argument("--lost-seconds", type=int, default=30,
+                    help="no frames for this long = stream lost alert (default 30)")
     args = ap.parse_args()
 
     certfile, keyfile = get_or_create_cert()
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(certfile, keyfile)
 
+    tg = None
+    if args.telegram:
+        tg, src = Telegram.from_env()
+        if tg is None:
+            print("[telegram] no credentials found (env or uload/.env.local); alerts go to this log only.", flush=True)
+        else:
+            print(f"[telegram] alerts ON (credentials from {src})", flush=True)
+
     app = build_app(args.fps, max(0.1, min(1.0, args.quality)),
-                    max(0, args.idle_seconds) * 1000, audio=args.audio)
+                    max(0, args.idle_seconds) * 1000, audio=args.audio,
+                    width=args.width, height=args.height, tg=tg,
+                    report_minutes=args.report_minutes, lost_seconds=args.lost_seconds)
 
     ips = all_local_ipv4()
     print("=" * 60, flush=True)
-    print(" LAN Cam host ready. Open ONE of these in Safari on the phone:", flush=True)
+    print(" LAN Cam host ready.", flush=True)
+    if args.plain_port:
+        print(f" - Android app: finds this PC by itself (UDP {args.discovery_port}, ws port {args.plain_port}).", flush=True)
+        print(f"   Manual host if needed: {primary_lan_ip()}:{args.plain_port}", flush=True)
+    print(" - iPhone / Safari: open ONE of these and accept the certificate once:", flush=True)
     for ip in ips:
         print(f"     https://{ip}:{args.port}", flush=True)
-    print("", flush=True)
-    print(" - Accept the self-signed certificate warning once.", flush=True)
-    print(" - Tap 'Start camera' and allow camera access.", flush=True)
-    print(" - Then run the monitor:  python readnew2.py", flush=True)
+    print(" - Monitor:  python readnew2.py", flush=True)
     print("   (do not run publish.py/manager.py at the same time)", flush=True)
     if args.audio:
         print(" - Audio ON: phone mic -> rattle_cadence.json + rattle_audio_*.wav recording", flush=True)
     print("=" * 60, flush=True)
 
     try:
-        web.run_app(app, host="0.0.0.0", port=args.port, ssl_context=ssl_ctx, print=None)
+        asyncio.run(serve(app, args, ssl_ctx))
     except KeyboardInterrupt:
         pass
 

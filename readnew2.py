@@ -21,6 +21,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 RATTLE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rattle_cadence.json")
+# Alarm state mirrored for lancam_host.py (Telegram alerts). Write-only from here.
+ALARM_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flame_alarm.json")
 
 
 class RaspiNinjaFrameReader:
@@ -672,6 +674,7 @@ class ChangePlotGUI(tk.Tk):
                     self.bell()
                 self.stream_alarm_active = True
                 self.alarm_var.set(f"STREAM STALLED: no new frames for {stalled_for:.1f}s")
+        self._publish_alarm_state(stalled, now)
         # ------------------------------------------------------------------
 
         if frame_bgr is None:
@@ -810,6 +813,41 @@ class ChangePlotGUI(tk.Tk):
         self.ax.set_ylim(0, min(255.0, y_max))
 
         self.plot_canvas.draw_idle()
+
+    def _publish_alarm_state(self, stalled, now):
+        """Mirror the alarm state to flame_alarm.json so lancam_host.py can send
+        Telegram alerts. Written on change plus a 10 s heartbeat (a stale file
+        tells the host the monitor is closed). Never affects the GUI or beeps."""
+        stable_for = (now - self.stable_start_ts) if self.stable_start_ts is not None else 0.0
+        # Based on stable_start_ts rather than no_change_alarm_active, which is
+        # briefly reset on every new (or duplicate) frame.
+        no_change = stable_for >= self.stable_seconds_to_alarm
+        state = (no_change, bool(stalled))
+        if (state == getattr(self, "_alarm_pub_state", None)
+                and now - getattr(self, "_alarm_pub_ts", 0.0) < 10.0):
+            return
+        self._alarm_pub_state = state
+        self._alarm_pub_ts = now
+        try:
+            thr = float(self.change_threshold_var.get())
+        except Exception:
+            thr = None
+        data = {
+            "no_change": no_change,
+            "stalled": bool(stalled),
+            "stable_for": round(stable_for, 1),
+            "threshold": thr,
+            "seconds_to_alarm": self.stable_seconds_to_alarm,
+            "roi": self.roi is not None,
+            "t": now,
+        }
+        try:
+            tmp = ALARM_JSON + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, ALARM_JSON)
+        except Exception:
+            pass
 
     def _poll_rattle(self):
         """Read rattle_cadence.json (written ~1/s by lancam_host --audio) and

@@ -212,3 +212,9 @@ rattle_audio_*.wav
 
 # LAN Cam self-signed TLS cert + private key (never commit)
 .lancam_certs/
+
+# FlameCam runtime state
+flame_alarm.json
+flame_alarm.json.tmp
+lancam_status.json
+lancam_status.json.tmp
