@@ -452,12 +452,16 @@ class ChangePlotGUI(tk.Tk):
         # the square is on (Esc also leaves); right-click hides it.
         self._ind_off_x = 0
         self._ind_off_y = 0
-        for wdg in (self.indicator_popup, self.indicator_face, self.indicator_label, self.indicator_status):
-            wdg.bind("<Button-1>", self._ind_press)
-            wdg.bind("<B1-Motion>", self._ind_motion)
-            wdg.bind("<Double-Button-1>", lambda e: self._ind_toggle_fullscreen())
-            wdg.bind("<Button-3>", lambda e: self.toggle_indicator())
-        self.indicator_popup.bind("<Escape>", lambda e: self._ind_toggle_fullscreen() if self._ind_fullscreen else None)
+        # Bind on the Toplevel ONLY: Tk puts the toplevel in every child's
+        # bindtags, so this already fires once for clicks anywhere inside.
+        # Binding the children too would fire each event twice (a double-click
+        # would toggle fullscreen on and straight back off).
+        p = self.indicator_popup
+        p.bind("<Button-1>", self._ind_press)
+        p.bind("<B1-Motion>", self._ind_motion)
+        p.bind("<Double-Button-1>", lambda e: self._ind_toggle_fullscreen())
+        p.bind("<Button-3>", lambda e: self.toggle_indicator())
+        p.bind("<Escape>", lambda e: self._ind_toggle_fullscreen() if self._ind_fullscreen else None)
 
         self.indicator_popup.update_idletasks()
         self.indicator_popup.lift()
