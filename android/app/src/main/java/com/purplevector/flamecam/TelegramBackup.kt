@@ -35,6 +35,12 @@ class TelegramBackup(private val ctx: Context, private val prefs: Prefs) {
             .firstOrNull { it.exists() } ?: return
         try {
             val o = JSONObject(f.readText())
+            if (o.optBoolean("disable")) {
+                prefs.tgToken = ""
+                prefs.tgChat = ""
+                Log.i(TAG, "telegram backup alerts turned off")
+                return
+            }
             val tok = o.optString("token")
             val chat = o.optString("chat_id")
             if (tok.isNotEmpty() && chat.isNotEmpty()) {

@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
+import tkinter.font as tkfont
 from appicon import apply_flame_icon
 import cv2
 
@@ -189,6 +190,11 @@ class ChangePlotGUI(tk.Tk):
          # ---- INDICATOR POP-OUT ----
         self.indicator_popup = None
         self.indicator_label = None
+        self.indicator_face = None
+        self.indicator_status = None
+        self._ind_flame_col = "#777777"
+        self._ind_flame_word = "NO STREAM"
+        self._ind_fullscreen = False
 
         # How often "red beep" is allowed (reuse your cooldown if you want)
         self.indicator_size_px = 70
@@ -405,14 +411,14 @@ class ChangePlotGUI(tk.Tk):
             return
 
         self.indicator_popup = tk.Toplevel(self)
-        # Borderless floating dot (no title bar, not in the taskbar).
+        # Borderless floating square (no title bar, not in the taskbar).
         try:
             self.indicator_popup.overrideredirect(True)
         except Exception:
             pass
         s = int(self.indicator_size_px)
         self.indicator_popup.geometry(f"{s}x{s}+40+40")
-        self.indicator_popup.resizable(False, False)
+        self.indicator_popup.configure(bg="#777777")
 
         # Stay above everything, and keep re-asserting it below.
         try:
@@ -420,31 +426,99 @@ class ChangePlotGUI(tk.Tk):
         except Exception:
             pass
 
-        # A single square whose bg we change to show state.
-        self.indicator_label = tk.Label(self.indicator_popup, bg="#777777", bd=6,
-                                        relief="raised", cursor="fleur")
-        self.indicator_label.pack(fill="both", expand=True)
+        # Layout: the popup's own bg is the FLAME state (green / red / grey),
+        # visible as a thick ring. Inside sits the cook timer on a dark face,
+        # coloured by how long the cook has run. With no cook running the face
+        # takes the flame colour too, so it looks like the old plain square.
+        self._ind_font = tkfont.Font(family="Segoe UI", size=-20, weight="bold")
+        self._ind_small_font = tkfont.Font(family="Segoe UI", size=-12, weight="bold")
+        self.indicator_face = tk.Frame(self.indicator_popup, bg="#777777", cursor="fleur")
+        self.indicator_face.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.8, relheight=0.8)
+        self.indicator_label = tk.Label(self.indicator_face, bg="#777777", fg="white",
+                                        font=self._ind_font, text="", cursor="fleur")
+        self.indicator_label.place(relx=0.5, rely=0.5, anchor="center")
+        # Status words, only shown when the indicator is big (fullscreen).
+        self.indicator_status = tk.Label(self.indicator_face, bg="#777777", fg="white",
+                                         font=self._ind_small_font, text="", cursor="fleur")
 
-        # Drag from anywhere on the dot to move it; double-click raises the main
-        # window; right-click hides the dot (there is no title bar to close it).
+        self._ind_flame_col = "#777777"
+        self._ind_flame_word = "NO STREAM"
+        self._ind_fullscreen = False
+        self._ind_saved_geom = None
+        self._ind_flash_on = False
+        self._ind_last_size = None
+
+        # Drag to move; double-click toggles fullscreen on whichever monitor
+        # the square is on (Esc also leaves); right-click hides it.
         self._ind_off_x = 0
         self._ind_off_y = 0
-        self.indicator_label.bind("<Button-1>", self._ind_press)
-        self.indicator_label.bind("<B1-Motion>", self._ind_motion)
-        self.indicator_label.bind("<Double-Button-1>", lambda e: self.lift())
-        self.indicator_label.bind("<Button-3>", lambda e: self.toggle_indicator())
+        for wdg in (self.indicator_popup, self.indicator_face, self.indicator_label, self.indicator_status):
+            wdg.bind("<Button-1>", self._ind_press)
+            wdg.bind("<B1-Motion>", self._ind_motion)
+            wdg.bind("<Double-Button-1>", lambda e: self._ind_toggle_fullscreen())
+            wdg.bind("<Button-3>", lambda e: self.toggle_indicator())
+        self.indicator_popup.bind("<Escape>", lambda e: self._ind_toggle_fullscreen() if self._ind_fullscreen else None)
 
         self.indicator_popup.update_idletasks()
         self.indicator_popup.lift()
         self._ind_keep_top()
+        self._ind_tick()
+
+    def _ind_alive(self):
+        return self.indicator_popup is not None and self.indicator_popup.winfo_exists()
+
+    def _ind_monitor_rect(self):
+        """(x, y, w, h) of the monitor the indicator's centre is on."""
+        p = self.indicator_popup
+        cx = p.winfo_rootx() + p.winfo_width() // 2
+        cy = p.winfo_rooty() + p.winfo_height() // 2
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+            hmon = user32.MonitorFromPoint(wintypes.POINT(cx, cy), 2)  # MONITOR_DEFAULTTONEAREST
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if hmon and user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+        return 0, 0, p.winfo_screenwidth(), p.winfo_screenheight()
+
+    def _ind_toggle_fullscreen(self):
+        if not self._ind_alive():
+            return
+        p = self.indicator_popup
+        if self._ind_fullscreen:
+            self._ind_fullscreen = False
+            p.geometry(self._ind_saved_geom or f"{self.indicator_size_px}x{self.indicator_size_px}+40+40")
+        else:
+            self._ind_saved_geom = p.geometry()
+            x, y, w, h = self._ind_monitor_rect()
+            self._ind_fullscreen = True
+            p.geometry(f"{w}x{h}+{x}+{y}")
+            p.focus_force()  # so Esc reaches it
+        self._ind_last_size = None  # force a font re-fit
+        self._ind_tick(reschedule=False)
 
     def _ind_press(self, e):
-        # Remember where on the dot we grabbed it.
-        self._ind_off_x = e.x
-        self._ind_off_y = e.y
+        # Remember where on the square we grabbed it (relative to the popup).
+        if not self._ind_alive():
+            return
+        self._ind_off_x = e.x_root - self.indicator_popup.winfo_rootx()
+        self._ind_off_y = e.y_root - self.indicator_popup.winfo_rooty()
 
     def _ind_motion(self, e):
-        if self.indicator_popup is None or not self.indicator_popup.winfo_exists():
+        if not self._ind_alive() or self._ind_fullscreen:
             return
         x = self.indicator_popup.winfo_pointerx() - self._ind_off_x
         y = self.indicator_popup.winfo_pointery() - self._ind_off_y
@@ -462,15 +536,76 @@ class ChangePlotGUI(tk.Tk):
         self.after(1500, self._ind_keep_top)
 
     def _set_indicator_colour(self, state: str):
-        # state: "grey" | "red" | "green"
-        if self.indicator_label is None or not self.indicator_label.winfo_exists():
+        # state: "grey" | "red" | "green"  (flame / stream state, shown as the ring)
+        if not self._ind_alive():
             return
         col = {
             "grey":  "#777777",
             "red":   "#cc0000",
             "green": "#00cc44",
         }.get(state, "#777777")
-        self.indicator_label.configure(bg=col)
+        self._ind_flame_word = {"grey": "NO STREAM", "red": "NO CHANGE", "green": "FLAME OK"}.get(state, "")
+        if col != self._ind_flame_col:
+            self._ind_flame_col = col
+            self._ind_tick(reschedule=False)
+
+    # Cook-time colours on the indicator: green, orange from 60 min,
+    # red from 90 min, flashing red from 110 min.
+    COOK_ORANGE_S = 60 * 60
+    COOK_RED_S = 90 * 60
+    COOK_FLASH_S = 110 * 60
+
+    def _ind_tick(self, reschedule=True):
+        """Redraw the indicator: ring = flame state, face = cook timer."""
+        if not self._ind_alive():
+            return
+        if reschedule:
+            self.after(500, self._ind_tick)
+        p = self.indicator_popup
+        ring = self._ind_flame_col
+        p.configure(bg=ring)
+
+        w, h = max(p.winfo_width(), 1), max(p.winfo_height(), 1)
+        big = min(w, h) >= 240
+
+        if self.cook_start_ts is None:
+            face_bg, fg, text = ring, "white", ""
+        else:
+            elapsed = max(0, time.time() - self.cook_start_ts)
+            hrs, rem = divmod(int(elapsed), 3600)
+            mins, secs = divmod(rem, 60)
+            text = f"{hrs}:{mins:02d}:{secs:02d}" if big else f"{hrs}:{mins:02d}"
+            face_bg = "#111111"
+            if elapsed >= self.COOK_FLASH_S:
+                self._ind_flash_on = not self._ind_flash_on if reschedule else self._ind_flash_on
+                face_bg, fg = ("#ff1a1a", "white") if self._ind_flash_on else ("#111111", "#ff1a1a")
+            elif elapsed >= self.COOK_RED_S:
+                fg = "#ff1a1a"
+            elif elapsed >= self.COOK_ORANGE_S:
+                fg = "#ff9900"
+            else:
+                fg = "#00dd55"
+
+        self.indicator_face.configure(bg=face_bg)
+        self.indicator_label.configure(bg=face_bg, fg=fg, text=text)
+        self.indicator_status.configure(bg=face_bg, fg="white" if face_bg != "#111111" else ring,
+                                        text=self._ind_flame_word if big else "")
+
+        # Re-fit fonts when the size or the text length changes.
+        key = (w, h, len(text), big)
+        if key != self._ind_last_size:
+            self._ind_last_size = key
+            face_w, face_h = w * 0.8, h * 0.8
+            n = max(len(text), 4)
+            px = int(min(face_h * (0.42 if big else 0.55), face_w / (0.62 * n)))
+            self._ind_font.configure(size=-max(px, 8))
+            self._ind_small_font.configure(size=-max(int(face_h * 0.09), 8))
+            if big:
+                self.indicator_label.place_configure(rely=0.45)
+                self.indicator_status.place(relx=0.5, rely=0.85, anchor="center")
+            else:
+                self.indicator_label.place_configure(rely=0.5)
+                self.indicator_status.place_forget()
 
     def _update_indicator_from_state(self, stalled: bool, alarm_active: bool):
         # Priority: stalled overrides everything

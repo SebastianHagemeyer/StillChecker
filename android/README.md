@@ -30,7 +30,10 @@ Upgrades: run it again (`--build` to force a rebuild).
 Rotate 90 degrees fixes a sideways picture. If the PC is never found (router
 blocks broadcast), type `PC-IP:8080` into the host box and Save.
 
-## Alerts (Telegram, PurpleVector bot)
+## Alerts (Telegram, PurpleVector bot), optional, off by default
+
+Tick 'Telegram alerts' in manager2 for the PC alerts; run `install.bat --telegram`
+for the phone backup alert.
 
 From the PC host (`--telegram`):
 - stream online / STREAM LOST (no frames 30 s) / stream back

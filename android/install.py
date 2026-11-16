@@ -5,6 +5,7 @@ One-shot FlameCam installer: phone plugged in over USB (or `adb connect`ed).
     python install.py              build if needed, install, set up everything
     python install.py --build      force a fresh build first
     python install.py --serial X   pick a device when several are attached
+    python install.py --telegram   also enable the phone's backup Telegram alert
 
 What it does:
   1. builds app-debug.apk with the Gradle wrapper (if missing or --build)
@@ -12,9 +13,9 @@ What it does:
   3. grants camera / mic / notification permissions (no prompts on the phone)
   4. exempts the app from battery optimisation + background restrictions,
      so Android never kills the stream while the screen is off
-  5. copies the Empire bot token into the app's PRIVATE storage via run-as
-     (for the phone's own "PC host is down" backup alert); never committed,
-     never on shared storage
+  5. Telegram backup alert: OFF by default (clears any stored token).
+     With --telegram it copies the Empire bot token into the app's PRIVATE
+     storage via run-as; never committed, never on shared storage
   6. launches the app
 """
 
@@ -59,7 +60,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", action="store_true")
     ap.add_argument("--serial")
-    ap.add_argument("--no-telegram", action="store_true")
+    ap.add_argument("--telegram", action="store_true",
+                    help="give the phone the bot token for its 'PC host is down' backup alert")
     a = ap.parse_args()
 
     adb = find_adb()
@@ -100,7 +102,14 @@ def main():
     sh("shell", "cmd", "appops", "set", PKG, "RUN_IN_BACKGROUND", "allow")
     print("Battery optimisation exemption set.")
 
-    if not a.no_telegram:
+    def provision(payload):
+        cmd = f"run-as {PKG} sh -c 'mkdir -p files && cat > files/telegram.json'"
+        r = subprocess.run(base + ["exec-in", cmd], input=payload, capture_output=True, text=True)
+        if r.returncode != 0:
+            r = subprocess.run(base + ["shell", cmd], input=payload, capture_output=True, text=True)
+        return r
+
+    if a.telegram:
         sys.path.insert(0, os.path.dirname(HERE))
         try:
             from flame_telegram import load_credentials
@@ -109,17 +118,17 @@ def main():
             tok = chat = None
             print(f"(could not load Telegram credentials: {exc})")
         if tok:
-            payload = json.dumps({"token": tok, "chat_id": chat})
-            cmd = f"run-as {PKG} sh -c 'mkdir -p files && cat > files/telegram.json'"
-            r = subprocess.run(base + ["exec-in", cmd], input=payload, capture_output=True, text=True)
-            if r.returncode != 0:
-                r = subprocess.run(base + ["shell", cmd], input=payload, capture_output=True, text=True)
+            r = provision(json.dumps({"token": tok, "chat_id": chat}))
             if r.returncode == 0:
                 print("Telegram backup alerts configured on the phone.")
             else:
                 print("Could not copy Telegram credentials (phone backup alerts off):", r.stderr.strip())
         else:
             print("No Telegram credentials found; phone backup alerts off.")
+    else:
+        # Default: make sure the phone holds no bot token (clears an older install's).
+        provision(json.dumps({"disable": True}))
+        print("Telegram backup alerts off (run with --telegram to turn them on).")
 
     sh("shell", "am", "start", "-n", f"{PKG}/.MainActivity")
     print("\nDone. On the phone: tap Start streaming, then press the power button.")

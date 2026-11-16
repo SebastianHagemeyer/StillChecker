@@ -107,7 +107,7 @@ class LanCamManager(tk.Tk):
         self.res_var = tk.StringVar(value="1280x720")
         ttk.Combobox(opts, textvariable=self.res_var, values=RESOLUTIONS, width=11,
                      state="readonly").grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 6))
-        self.telegram_var = tk.BooleanVar(value=True)
+        self.telegram_var = tk.BooleanVar(value=False)  # off by default; tick for alerts
         ttk.Checkbutton(opts, text="Telegram alerts (Empire bot)", variable=self.telegram_var).grid(
             row=1, column=3, columnspan=4, sticky="w", padx=(18, 6), pady=(0, 6))
 
